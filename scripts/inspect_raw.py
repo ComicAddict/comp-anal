@@ -146,13 +146,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n{'=' * 70}\n{len(rows)} file(s) parsed.")
     if limited:
         travel = [r["post_contact_travel"] for r in limited]
+        # This tool has no geometry, so it reports travel and stops short of
+        # claiming anything about strain or densification -- run_analysis.py
+        # makes that call once specimens.csv supplies the specimen height.
         print(
-            f"{len(limited)} of {len(rows)} stopped at a load limit, reaching "
+            f"{len(limited)} of {len(rows)} were still loading when recording "
+            f"stopped (ended at peak\nforce / load limit), after "
             f"{min(travel):.2f}-{max(travel):.2f} mm of post-contact travel.\n"
-            f"Densification was not reached in these, so densification strain, "
-            f"energy absorption\nand SEA will be lower bounds. Modulus, plateau "
-            f"stress and first-peak metrics are\nunaffected where the curve "
-            f"covers them."
+            f"Whether that reached densification depends on specimen height; "
+            f"run_analysis.py\nreports it once specimens.csv is filled in. "
+            f"Expect energy absorption and SEA to be\nlower bounds for these."
         )
 
     if args.duplicates:

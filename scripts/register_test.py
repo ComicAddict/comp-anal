@@ -186,6 +186,93 @@ def existing_ids(specimens_csv: Path) -> set[str]:
         return {r["test_id"].strip() for r in csv.DictReader(handle) if r.get("test_id")}
 
 
+def duplicate_raw_files(raw_dir: Path, pending: list[str]) -> set[str]:
+    """Files whose measurements duplicate an earlier file in the list.
+
+    The first member of each group is left unmarked -- it is the one to keep.
+    A file that cannot be parsed is simply not compared.
+    """
+    from src.io import RawParseError, read_raw_csv
+    from src.pipeline import data_digest
+
+    seen: dict[str, str] = {}
+    duplicates: set[str] = set()
+    for raw_file in pending:
+        try:
+            digest = data_digest(read_raw_csv(raw_dir / raw_file))
+        except (RawParseError, OSError):
+            continue
+        if digest in seen:
+            duplicates.add(raw_file)
+        else:
+            seen[digest] = raw_file
+    return duplicates
+
+
+def write_template(paths, pending: list[str], skip: set[str]) -> int:
+    """Create a specimens.csv skeleton, one row per unregistered raw file.
+
+    Fills in what can be known without touching the specimen -- test_id and
+    test_date from the filename -- and leaves pattern and geometry blank for
+    the user. Duplicate re-exports are listed but commented in `notes` rather
+    than dropped, so nothing disappears silently.
+    """
+    if paths.specimens_csv.exists():
+        print(
+            f"error: {paths.specimens_csv} already exists; refusing to overwrite it.",
+            file=sys.stderr,
+        )
+        return 1
+
+    rows = []
+    for raw_file in pending:
+        duplicate = raw_file in skip
+        rows.append(
+            {
+                "test_id": Path(raw_file).stem,
+                "raw_file": raw_file,
+                "pattern_name": "",
+                "pattern_params": "{}",
+                "replicate": "",
+                "side_length_mm": "",
+                "cross_section_area_mm2": "",
+                "initial_height_mm": "",
+                "relative_density": "",
+                "mass_g": "",
+                "material": "",
+                "test_date": date_from_filename(raw_file) or "",
+                "notes": (
+                    "DUPLICATE of another export in this list -- delete this row "
+                    "unless it really is a separate specimen"
+                    if duplicate
+                    else ""
+                ),
+            }
+        )
+
+    paths.specimens_csv.parent.mkdir(parents=True, exist_ok=True)
+    with paths.specimens_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(COLUMNS))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Wrote {len(rows)} row(s) to {paths.specimens_csv}\n")
+    print("Fill in these columns for each row, then run scripts/run_analysis.py:")
+    print("  pattern_name      the internal pattern, or 'solid' for the baseline")
+    print("  replicate         repeat number within that pattern")
+    print("  side_length_mm    nominal cube side")
+    print("  initial_height_mm height along the load axis")
+    print("  material          build material")
+    print("\nOptional but worth having:")
+    print("  mass_g            enables SEA per unit mass instead of per volume")
+    print("  relative_density  specimen / bulk material density")
+    print("  pattern_params    JSON, e.g. {\"cell_mm\": 5.0, \"wall_mm\": 0.8}")
+    print("\ncross_section_area_mm2 can stay blank -- it is derived as side_length^2.")
+    if skip:
+        print(f"\n{len(skip)} row(s) are marked as duplicate re-exports; see 'notes'.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -197,6 +284,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--interactive", action="store_true", help="prompt for each field"
+    )
+    parser.add_argument(
+        "--template",
+        action="store_true",
+        help="write a specimens.csv skeleton covering every unregistered file, "
+        "with pattern and geometry left blank to fill in by hand",
     )
     parser.add_argument(
         "--raw-file",
@@ -243,6 +336,12 @@ def main(argv: list[str] | None = None) -> int:
             for name in pending:
                 print(f"  {name}")
         return 0
+
+    if args.template:
+        if not pending:
+            print(f"Nothing to do -- every CSV in {paths.raw_dir} is registered.")
+            return 0
+        return write_template(paths, pending, duplicate_raw_files(paths.raw_dir, pending))
 
     if args.raw_file:
         targets = [args.raw_file]

@@ -180,11 +180,22 @@ def validate_frame(frame: pd.DataFrame, raw_dir: Path | None = None) -> pd.DataF
             "with: python scripts/register_test.py --interactive"
         )
 
-    # Required cells non-null.
+    # Required cells non-null. Reported one line per column with the affected
+    # rows collected, rather than one line per cell -- a freshly templated file
+    # is missing the same few columns everywhere, and 25 near-identical lines
+    # bury the point.
     for col in REQUIRED_NON_NULL:
         blank = frame[col].isna() | (frame[col].astype(str).str.strip() == "")
-        for idx in frame.index[blank]:
-            problems.append(f"row {idx + 2}: '{col}' is required but empty")
+        rows = [int(idx) + 2 for idx in frame.index[blank]]
+        if not rows:
+            continue
+        if len(rows) == len(frame):
+            where = "every row"
+        elif len(rows) > 4:
+            where = f"rows {rows[0]}-{rows[-1]} ({len(rows)} rows)"
+        else:
+            where = "row " + ", ".join(str(r) for r in rows)
+        problems.append(f"'{col}' is required but empty on {where}")
 
     # Numeric columns parse.
     for col in NUMERIC:

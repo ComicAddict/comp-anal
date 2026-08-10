@@ -320,6 +320,75 @@ def test_register_test_cli_appends_a_row(tmp_path, capsys):
     assert specimens.loc[0, "initial_height_mm"] == 20.0   # defaulted from side
 
 
+def test_register_test_cli_template_covers_every_file(tmp_path, capsys):
+    """--template pre-fills what the filename knows and leaves geometry blank."""
+    import register_test as cli
+    from src.synthetic import SyntheticTest
+
+    raw_dir = tmp_path / "data" / "raw"
+    for name in ("solid_compression_20260717_192209_1_1.csv", "b.csv"):
+        SyntheticTest(name=name, seed=hash(name) % 1000).write(raw_dir / name)
+
+    assert cli.main(["--root", str(tmp_path), "--template"]) == 0
+    specimens = pd.read_csv(tmp_path / "data" / "specimens.csv", dtype=str)
+
+    assert len(specimens) == 2
+    assert set(specimens["raw_file"]) == {
+        "solid_compression_20260717_192209_1_1.csv",
+        "b.csv",
+    }
+    dated = specimens[specimens["raw_file"].str.startswith("solid")]
+    assert dated["test_date"].iloc[0] == "2026-07-17"
+    assert specimens["pattern_name"].isna().all()  # left for the user
+    assert "run_analysis" in capsys.readouterr().out
+
+
+def test_register_test_cli_template_marks_duplicate_exports(tmp_path, capsys):
+    """A re-export of the same test is flagged in the template, not dropped."""
+    import register_test as cli
+    from src.synthetic import SyntheticTest
+
+    raw_dir = tmp_path / "data" / "raw"
+    SyntheticTest(name="a.csv", seed=5).write(raw_dir / "a.csv")
+    # Same measurements, written without the boilerplate block.
+    lines = (raw_dir / "a.csv").read_text().splitlines()
+    header = next(i for i, l in enumerate(lines) if l.startswith("Time,"))
+    (raw_dir / "a_reexport.csv").write_text("\n".join([""] + lines[header:]) + "\n")
+
+    assert cli.main(["--root", str(tmp_path), "--template"]) == 0
+    specimens = pd.read_csv(tmp_path / "data" / "specimens.csv", dtype=str).fillna("")
+
+    notes = dict(zip(specimens["raw_file"], specimens["notes"]))
+    assert len(specimens) == 2, "the duplicate must still be listed"
+    assert notes["a.csv"] == "", "the first of the pair is the one to keep"
+    assert "DUPLICATE" in notes["a_reexport.csv"]
+
+
+def test_register_test_cli_template_refuses_to_overwrite(tmp_path, capsys):
+    """A filled-in specimens.csv must never be clobbered by a new export."""
+    import register_test as cli
+    from src.synthetic import SyntheticTest
+
+    raw_dir = tmp_path / "data" / "raw"
+    SyntheticTest(name="a.csv", seed=1).write(raw_dir / "a.csv")
+    assert cli.main(["--root", str(tmp_path), "--template"]) == 0
+
+    # A new test arrives after the table has been started.
+    SyntheticTest(name="b.csv", seed=2).write(raw_dir / "b.csv")
+    assert cli.main(["--root", str(tmp_path), "--template"]) == 1
+    assert "refusing to overwrite" in capsys.readouterr().err
+
+
+def test_register_test_cli_template_is_a_no_op_when_all_registered(tmp_path, capsys):
+    import register_test as cli
+    from src.synthetic import SyntheticTest
+
+    SyntheticTest(name="a.csv", seed=1).write(tmp_path / "data" / "raw" / "a.csv")
+    assert cli.main(["--root", str(tmp_path), "--template"]) == 0
+    assert cli.main(["--root", str(tmp_path), "--template"]) == 0
+    assert "Nothing to do" in capsys.readouterr().out
+
+
 def test_register_test_cli_reads_date_from_filename(tmp_path):
     import register_test as cli
     from src.synthetic import SyntheticTest

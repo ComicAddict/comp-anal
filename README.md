@@ -25,7 +25,8 @@ python scripts/inspect_raw.py --duplicates
 
 # 1. Drop instrument CSVs into data/raw/, then register each one once.
 python scripts/register_test.py --list          # what still needs registering
-python scripts/register_test.py --interactive   # prompts for pattern + geometry
+python scripts/register_test.py --template      # skeleton specimens.csv to fill in
+python scripts/register_test.py --interactive   # or be prompted field by field
 
 # 2. Analyse everything and draw the figures.
 python scripts/run_analysis.py
@@ -176,6 +177,25 @@ it does not fail on the first one.
 
 `scripts/register_test.py` appends rows for you, interactively or from CLI
 flags, and refuses duplicate `test_id`s and malformed JSON at entry time.
+`--template` writes a skeleton covering every unregistered file, pre-filling
+`test_id` and `test_date` from the filename and marking duplicate re-exports in
+`notes`, leaving pattern and geometry to enter by hand.
+
+### Current state of the real data
+
+`data/specimens.csv` is a template covering the five exports in `data/raw/`,
+with geometry left blank — **the analysis will not run until it is filled in**,
+and says exactly which columns are missing if you try. What is still needed:
+
+- **`side_length_mm` and `initial_height_mm`.** Nothing in the raw files records
+  specimen size, and without it displacement cannot become strain. Worth a
+  sanity check when you fill it: at 9.5 kN a 20 mm cube sees only ~24 MPa, and
+  the yield knee in these curves sits near ~14 MPa, which is low for solid PLA.
+- **`pattern_name` and `replicate`.** The filenames suffix `_1_1`, `_2_1`,
+  `_4_1`, `_5_1`, `_5_2` (no `_3_1`), but per the brief nothing is inferred from
+  them. Note `_5_1` and `_5_2` are the same test exported twice — delete one row
+  unless it really is a second specimen.
+- **`material`**, and optionally `mass_g` to get SEA per unit mass.
 
 ---
 
@@ -397,6 +417,14 @@ Resolutions to the questions raised in the brief, all reversible:
    the note under *Plateau stress*.
 3. **Units.** MPa / N / mm throughout, as proposed. Energy is reported both
    volumetrically (MJ/m³) and absolutely (J).
+
+Now that real data has arrived, one more worth settling:
+
+6. **The plateau window may not be reachable.** These tests stop at 5.5–5.9 mm
+   of travel. On a 20 mm specimen that is ~28–30% strain, so the 20–30% plateau
+   window is only just covered and the ISO 20–40% window would not be reachable
+   at all. If the plateau stress matters, either raise the load limit or expect
+   the window to need moving down for this geometry.
 
 Two additions worth knowing about:
 

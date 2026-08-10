@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -175,6 +176,68 @@ def test_missing_raw_file_is_reported_before_analysis(dataset):
     sorted(paths.raw_dir.glob("*.csv"))[0].unlink()
     with pytest.raises(SpecimenError, match="missing raw files"):
         run_analysis(paths, DEFAULT_CONFIG)
+
+
+def test_duplicate_exports_are_flagged_not_counted_as_replicates(dataset):
+    """The same test exported twice must not masquerade as two specimens."""
+    paths = PipelinePaths.from_root(dataset)
+    specimens = pd.read_csv(paths.specimens_csv)
+    source = str(specimens.loc[0, "raw_file"])
+    # Re-export one test under a new name, as the instrument software does.
+    shutil.copy(paths.raw_dir / source, paths.raw_dir / "reexport.csv")
+
+    clone = specimens.iloc[[0]].copy()
+    clone["test_id"] = "reexport"
+    clone["raw_file"] = "reexport.csv"
+    clone["replicate"] = 99
+    pd.concat([specimens, clone], ignore_index=True).to_csv(
+        paths.specimens_csv, index=False
+    )
+
+    result = run_analysis(paths, DEFAULT_CONFIG)
+    dupes = result.diagnostics[result.diagnostics["code"] == "duplicate_test_data"]
+    assert len(dupes) == 2, "both members of the duplicate pair should be flagged"
+    assert set(dupes["test_id"]) == {"reexport", str(specimens.loc[0, "test_id"])}
+    assert (dupes["level"] == "warning").all()
+
+
+def test_duplicate_detection_ignores_how_the_file_was_written(dataset):
+    """Identical measurements count as duplicates even with different headers."""
+    from src.io import read_raw_csv
+    from src.pipeline import data_digest, group_duplicates
+
+    paths = PipelinePaths.from_root(dataset)
+    original = sorted(paths.raw_dir.glob("*.csv"))[0]
+
+    # Same data, boilerplate stripped -- byte-different, measurement-identical.
+    lines = original.read_text().splitlines()
+    header = next(i for i, l in enumerate(lines) if l.startswith("Time,"))
+    bare = paths.raw_dir / "bare.csv"
+    bare.write_text("\n".join([""] + lines[header:]) + "\n")
+
+    assert original.read_bytes() != bare.read_bytes()
+    digests = {
+        "original": data_digest(read_raw_csv(original)),
+        "bare": data_digest(read_raw_csv(bare)),
+    }
+    assert digests["original"] == digests["bare"]
+    assert group_duplicates(digests) == [["bare", "original"]]
+
+
+def test_distinct_tests_are_not_flagged_as_duplicates(dataset):
+    paths = PipelinePaths.from_root(dataset)
+    result = run_analysis(paths, DEFAULT_CONFIG)
+    assert "duplicate_test_data" not in set(result.diagnostics["code"])
+
+
+def test_force_limit_surfaces_in_the_metrics_table(dataset):
+    paths = PipelinePaths.from_root(dataset)
+    cfg = DEFAULT_CONFIG.replace(force_limit_kN=0.5)  # below the synthetic peak
+    metrics = run_analysis(paths, cfg).metrics
+    assert "ended_at_force_limit" in metrics.columns
+    assert metrics["ended_at_force_limit"].astype(bool).all()
+    assert "tare_offset_N" in metrics.columns
+    assert "preload_slack_mm" in metrics.columns
 
 
 def test_diagnostics_capture_parser_and_metric_warnings(dataset):

@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.config import DEFAULT_CONFIG, AnalysisConfig
+from src.config import AnalysisConfig, load_project_config
 from src.pipeline import PipelinePaths, input_fingerprint, is_stale, run_pipeline
 from src.specimens import SpecimenError
 
@@ -69,6 +69,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--modulus-max-strain", type=float, help="upper strain for the modulus search (0.10)"
     )
     group.add_argument(
+        "--force-limit-kN",
+        type=float,
+        help="load limit the tests were set to stop at (e.g. 9.5). Tests that "
+        "terminate against it are flagged as truncated, since densification "
+        "was never reached",
+    )
+    group.add_argument(
+        "--no-tare",
+        action="store_true",
+        help="keep the pre-contact load-cell offset instead of subtracting it",
+    )
+    group.add_argument(
         "--toe-compensation",
         action="store_true",
         help="shift the strain axis so the fitted elastic line passes through the origin",
@@ -77,7 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_config(args: argparse.Namespace) -> AnalysisConfig:
-    cfg = AnalysisConfig.from_json(args.config) if args.config else DEFAULT_CONFIG
+    cfg = load_project_config(args.config, args.root)
     overrides = {}
     if args.plateau_lo is not None:
         overrides["plateau_strain_lo"] = args.plateau_lo
@@ -89,6 +101,10 @@ def resolve_config(args: argparse.Namespace) -> AnalysisConfig:
         overrides["modulus_search_max_strain"] = args.modulus_max_strain
     if args.toe_compensation:
         overrides["toe_compensation"] = True
+    if args.force_limit_kN is not None:
+        overrides["force_limit_kN"] = args.force_limit_kN
+    if args.no_tare:
+        overrides["tare_correction"] = False
     return cfg.replace(**overrides) if overrides else cfg
 
 
@@ -114,6 +130,39 @@ def summarise(result, paths: PipelinePaths) -> None:
                 tests = ", ".join(sorted(set(block["test_id"].astype(str)))[:5])
                 more = "" if block["test_id"].nunique() <= 5 else ", ..."
                 print(f"  {code} ({len(block)}): {tests}{more}")
+
+    # Truncation changes how the numbers may be read, so it is stated plainly
+    # rather than left inside the diagnostics file.
+    if "ended_at_force_limit" in metrics.columns:
+        truncated = metrics[metrics["ended_at_force_limit"].astype(bool)]
+        if len(truncated):
+            print(
+                f"\n{len(truncated)} of {len(metrics)} test(s) were still loading "
+                f"when recording stopped (ended at peak force / load limit)."
+            )
+            # Ending at peak load and failing to densify are different problems:
+            # a test can run past densification and still be cut off climbing.
+            no_dens = truncated
+            if "densification_at_end_of_data" in truncated.columns:
+                no_dens = truncated[
+                    truncated["densification_at_end_of_data"].astype(bool)
+                    | truncated["densification_strain"].isna()
+                ]
+            if len(no_dens):
+                print(
+                    f"  {len(no_dens)} of those never reached densification, so "
+                    f"densification_strain,\n"
+                    f"  energy_absorption_* and SEA are LOWER BOUNDS for them."
+                )
+            if len(truncated) > len(no_dens):
+                print(
+                    f"  The other {len(truncated) - len(no_dens)} did densify; only "
+                    f"energy integrated past that point is affected."
+                )
+            print(
+                "  Modulus, plateau stress and first-peak metrics are unaffected "
+                "where the curve reaches them."
+            )
 
     if not result.skipped and len(metrics):
         columns = [

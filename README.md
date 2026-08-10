@@ -20,6 +20,9 @@ Two questions this is built to answer:
 ```bash
 pip install -r requirements.txt
 
+# 0. Check what a new export actually contains (no metadata needed).
+python scripts/inspect_raw.py --duplicates
+
 # 1. Drop instrument CSVs into data/raw/, then register each one once.
 python scripts/register_test.py --list          # what still needs registering
 python scripts/register_test.py --interactive   # prompts for pattern + geometry
@@ -29,6 +32,13 @@ python scripts/run_analysis.py
 
 # 3. Redraw figures without re-parsing (or explore other metric pairs).
 python scripts/plot_envelope.py --pair modulus_MPa sea_J_per_g
+```
+
+Machine setup lives in `analysis_config.json` at the repo root and is picked up
+automatically. It currently records the 9.5 kN load limit:
+
+```json
+{ "force_limit_kN": 9.5 }
 ```
 
 **Want to see it work before you have data registered?** Generate a synthetic
@@ -75,15 +85,19 @@ Time,Displacement,Force
 "0.0000","0.0000","0.0000"
 ```
 
-What the parser does about it (`src/io.py`):
+What the parser does about it (`src/io.py`). Everything marked ✔ is confirmed
+against the real exports in `data/raw/`:
 
 | Quirk | Handling |
 |---|---|
-| Boilerplate preamble | The header row is **found by scanning**, not by skipping a fixed 7 lines, so an added or dropped blank line is harmless. Non-boilerplate text above the header is flagged. |
+| Boilerplate preamble ✔ | The header row is **found by scanning**, not by skipping a fixed 7 lines. This is not hypothetical: `..._5_2.csv` has no boilerplate at all — one blank line, then straight to the header. A fixed skip would have silently eaten its first rows. |
+| CRLF line endings ✔ | Handled; a stray `\r` never reaches the units check. |
 | Units row | **Validated, and a mismatch is fatal.** A silent kN→N change would rescale every result by 1000. |
-| Quoted values | Stripped and cast to float; a non-numeric cell raises with its row number. |
-| Non-uniform sample rate | Never assumed. Every rate is derived from the `Time` column; gaps, resets and duplicate timestamps are reported. |
-| Load-cell noise near zero | Contact is the first sample above a threshold that *stays* above it for several samples, so one noise spike cannot trigger it. Displacement and time are re-zeroed there. |
+| Quoted values ✔ | Stripped and cast to float; a non-numeric cell raises with its row number. |
+| Non-uniform sample rate ✔ | Never assumed. Each real file carries one interval *shorter* than the nominal 0.02 s (0.002–0.010 s observed) — the opposite of the longer gap originally described. Both directions are reported. |
+| Load-cell tare ✔ | The cell reads a constant non-zero force before contact (0–2.3 N observed). Measured as `tare_offset_N` and subtracted by default (`--no-tare` to keep it). Small next to 9.5 kN, but it sits exactly where the modulus is fitted. |
+| Pre-contact slack ✔ | Contact is the first sample above a threshold that *stays* above it, so a noise spike cannot trigger it. Slack varies a lot between specimens — 0.10 mm to 0.89 mm across these five — so this is doing real work, not trimming a fixed offset. |
+| Load-limit termination ✔ | See below — the most consequential property of this dataset. |
 | Non-monotonic displacement | **Flagged, never dropped.** |
 
 Force is converted to newtons at parse time so everything downstream is in one
@@ -92,6 +106,47 @@ trimmed series.
 
 Every diagnostic lands in `results/diagnostics.csv` and is summarised at the end
 of a run.
+
+### Load-limited (truncated) tests
+
+All five current tests **stop against the 9.5 kN limit rather than densifying.**
+The frame runs out of load before the specimen runs out of behaviour, so the
+curve is cut off partway.
+
+This is detected two ways: explicitly against `force_limit_kN`, and — with no
+configuration at all — from the fact that the file *ends at its own maximum
+force*, which a specimen-driven test does not do. Either way the test is
+flagged, `ended_at_force_limit` is set in `metrics_summary.csv`, and the run
+prints a plain-language warning.
+
+What it means for the metrics:
+
+| Metric | Status on a truncated test |
+|---|---|
+| Young's modulus | **Valid** — the elastic region is early in the curve |
+| Plateau stress | **Valid if** the curve reaches the plateau window |
+| First peak / crush force | **Valid if** the peak occurs before cut-off |
+| Densification strain | **Lower bound** — densification never happened |
+| Energy absorption, SEA | **Lower bound** — integrated over a truncated curve |
+
+A genuine *hold* at the limit (frame parked, force flat, crosshead stopped) is
+trimmed, since it carries no material response. Samples that are merely near the
+limit while still loading are kept — the distinguishing test is mechanical
+(has the crosshead stopped?), not a proximity threshold, because a test ramping
+into its limit spends its final samples above any threshold while still
+measuring real material.
+
+### Duplicate exports
+
+The instrument re-exports the same test under different filenames —
+`..._5_1.csv` and `..._5_2.csv` here hold **byte-identical measurements**, one
+with the boilerplate header and one without. Registered as two rows they would
+pose as replicates and manufacture a spread no second specimen ever produced.
+
+Detection hashes the *parsed columns*, not the file bytes, so a re-export with a
+different header is still caught. `scripts/inspect_raw.py --duplicates` reports
+groups before you register anything; `run_analysis.py` warns if duplicates are
+registered anyway.
 
 ---
 
@@ -252,20 +307,31 @@ Defaults live in `src/config.py`, all documented inline. Override per run:
 python scripts/run_analysis.py --plateau-lo 0.20 --plateau-hi 0.40
 python scripts/run_analysis.py --densification-method iso
 python scripts/run_analysis.py --toe-compensation
+python scripts/run_analysis.py --force-limit-kN 9.5
 python scripts/run_analysis.py --config my_params.json    # any field
 ```
+
+Project-wide settings belong in `analysis_config.json` at the repo root, which
+every script loads unless `--config` points elsewhere. Keys starting with `_`
+are treated as comments, since JSON has none.
 
 **Toe compensation** (off by default) shifts the strain axis so the fitted
 elastic line passes through the origin, removing seating slack that threshold-
 based contact detection leaves behind. It changes every strain-referenced metric,
 so it is opt-in; `toe_strain` is always reported so you can see what it would do.
 
+Worth trying on this dataset: pre-contact slack ranges from 0.10 mm to 0.89 mm
+across the five tests, and the toe is curved rather than a clean offset, so
+threshold-based contact detection leaves a different amount of seating
+compliance in each specimen. That inflates the apparent spread in modulus
+between nominally identical specimens.
+
 ---
 
 ## Tests
 
 ```bash
-python -m pytest tests/ -q       # 109 tests
+python -m pytest tests/ -q       # 125 tests
 ```
 
 Coverage is aimed at the two things most likely to go quietly wrong: parsing
@@ -274,15 +340,13 @@ synthetic curves with analytically known modulus, plateau stress, densification
 strain and first peak, so a wrong answer fails rather than merely looking
 plausible.
 
-> **On the parser fixture.** The real
-> `solid_compression_20260717_192209_1_1.csv` was not attached to the brief, so
-> `tests/fixtures/` holds a synthetic file reproducing the documented format and
-> quirks — including the exact non-uniform timing described
-> (`…2.2600, 2.2820, 2.3020, 2.3220…`). **Drop the genuine export in over it and
-> the suite immediately validates against real instrument output**, no test
-> changes needed (`tests/conftest.py` prefers whatever file is there). Worth
-> doing — it is the one part of the pipeline written against a description
-> rather than the real thing.
+The parser is tested against **real instrument exports**, not a description of
+them: `tests/fixtures/` holds `solid_compression_20260717_192209_1_1.csv` (the
+full format) and the no-boilerplate variant of `..._5_2.csv`. Both are genuine
+files from the 10 kN frame, so the format tests fail if the parser stops
+handling what the machine actually writes. `src/synthetic.py` still generates
+instrument-format files, now used for the demo and for tests that need a curve
+with analytically known properties.
 
 ---
 
@@ -308,7 +372,9 @@ src/
   envelope.py              plotting
   pipeline.py              orchestration and change detection
   synthetic.py             instrument-format generation for tests and the demo
+analysis_config.json       machine setup (load limit); loaded automatically
 scripts/
+  inspect_raw.py           report what a raw file contains, before registering
   register_test.py         onboard a raw CSV into specimens.csv
   run_analysis.py          raw -> metrics_summary.csv (+ figures)
   plot_envelope.py         figures from an existing metrics summary

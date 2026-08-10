@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.config import DEFAULT_CONFIG, AnalysisConfig
+from src.config import AnalysisConfig, load_project_config
 from src.pipeline import (
     DEFAULT_PAIRS,
     LABELS,
@@ -79,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_config(args: argparse.Namespace) -> AnalysisConfig:
-    cfg = AnalysisConfig.from_json(args.config) if args.config else DEFAULT_CONFIG
+    cfg = load_project_config(args.config, args.root)
     if args.no_per_pattern_bands:
         cfg = cfg.replace(envelope_per_pattern_bands=False)
     return cfg

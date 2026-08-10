@@ -32,12 +32,36 @@ from src.synthetic import (  # noqa: E402
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+#: A real export that omits the "Results Table" boilerplate entirely.
+NO_BOILERPLATE_FILENAME = "no_boilerplate_solid_compression_20260717_192209_5_2.csv"
+
+
 @pytest.fixture(scope="session")
 def sample_csv() -> Path:
-    """Path to the reference instrument-format CSV."""
+    """A real instrument export from the 10 kN frame (1 kN/min, 9.5 kN limit)."""
     path = FIXTURES / SAMPLE_FILENAME
-    if not path.exists():  # regenerate if it was never committed
+    if not path.exists():  # fall back to the synthetic stand-in
         sample_test().write(path)
+    return path
+
+
+@pytest.fixture(scope="session")
+def no_boilerplate_csv() -> Path:
+    """A real export whose header is not preceded by the boilerplate block."""
+    path = FIXTURES / NO_BOILERPLATE_FILENAME
+    if not path.exists():
+        pytest.skip(f"{NO_BOILERPLATE_FILENAME} not present")
+    return path
+
+
+@pytest.fixture(scope="session")
+def duplicate_of_no_boilerplate_csv() -> Path:
+    """The same measurements as `no_boilerplate_csv`, exported with boilerplate."""
+    path = Path(__file__).parent.parent / "data" / "raw" / (
+        "solid_compression_20260717_192209_5_1.csv"
+    )
+    if not path.exists():
+        pytest.skip("paired export not present in data/raw/")
     return path
 
 

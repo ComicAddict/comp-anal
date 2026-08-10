@@ -23,9 +23,42 @@ class AnalysisConfig:
     expected_units: tuple[str, str, str] = ("(s)", "(mm)", "(kN)")
     #: A dt larger than this multiple of the median dt is reported as a gap.
     sampling_gap_factor: float = 3.0
+    #: A dt smaller than this fraction of the median dt is reported as a short
+    #: interval. The observed exports carry one such sample per file.
+    sampling_short_factor: float = 0.5
     #: Displacement decreases smaller than this (mm) are treated as noise
     #: rather than genuine non-monotonicity.
     displacement_monotonic_tol_mm: float = 1e-4
+
+    # ------------------------------------------------------------------
+    # Machine force limit (src.io)
+    # ------------------------------------------------------------------
+    #: The load limit the test was configured to stop at, in kN (the frame's
+    #: capacity is usually higher). Set this and every test that terminates
+    #: against it is flagged, because a force-limited test is truncated: the
+    #: specimen never reached densification, so densification strain, energy
+    #: absorption and SEA are lower bounds rather than measurements.
+    #: None disables the explicit check; the automatic one below still runs.
+    force_limit_kN: float | None = None
+    #: How close to `force_limit_kN` counts as "at the limit".
+    force_limit_tolerance_frac: float = 0.001
+    #: Even without `force_limit_kN`, a test whose final force is this fraction
+    #: of its own maximum was stopped by a limit rather than by the specimen.
+    truncation_final_force_frac: float = 0.999
+    #: Trailing samples held at the limit are material-free instrument output.
+    #: They are trimmed only when there are at least this many of them, so a
+    #: clean cut-off at the limit (what the observed files do) is left alone.
+    saturation_min_samples: int = 5
+
+    # ------------------------------------------------------------------
+    # Load-cell tare (src.io)
+    # ------------------------------------------------------------------
+    #: Subtract the pre-contact force offset (a non-zero load-cell reading at
+    #: the start of the file) from the trimmed series. The observed exports
+    #: start at 0-2.3 N. Reported either way as `tare_offset_N`.
+    tare_correction: bool = True
+    #: Samples averaged to estimate that offset.
+    tare_window_samples: int = 50
 
     # ------------------------------------------------------------------
     # Pre-load trimming (src.io)
@@ -131,6 +164,9 @@ class AnalysisConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AnalysisConfig":
+        # JSON has no comments, so keys starting with "_" are treated as notes
+        # and ignored. Anything else unrecognised is a typo and is rejected.
+        data = {k: v for k, v in data.items() if not k.startswith("_")}
         known = {f.name for f in fields(cls)}
         unknown = set(data) - known
         if unknown:
@@ -150,3 +186,22 @@ class AnalysisConfig:
 
 
 DEFAULT_CONFIG = AnalysisConfig()
+
+#: Project-level overrides, picked up automatically from the repository root.
+#: This is where machine setup belongs (the load limit the frame stops at, for
+#: instance) so every run agrees on it without repeating a flag.
+PROJECT_CONFIG_FILENAME = "analysis_config.json"
+
+
+def load_project_config(
+    explicit: str | Path | None = None, root: str | Path | None = None
+) -> AnalysisConfig:
+    """Resolve the config: an explicit file, else the project file, else defaults."""
+    if explicit is not None:
+        return AnalysisConfig.from_json(explicit)
+
+    base = Path(root) if root is not None else Path(__file__).resolve().parent.parent
+    candidate = base / PROJECT_CONFIG_FILENAME
+    if candidate.exists():
+        return AnalysisConfig.from_json(candidate)
+    return DEFAULT_CONFIG

@@ -184,6 +184,13 @@ def analyse_specimen(
             "n_samples_raw": len(loaded.raw),
             "n_samples_trimmed": len(loaded.trimmed),
             "contact_index": loaded.contact_index,
+            "preload_slack_mm": float(
+                loaded.raw["disp_mm"].iloc[loaded.contact_index]
+                - loaded.raw["disp_mm"].iloc[0]
+            ),
+            "tare_offset_N": loaded.tare_offset_N,
+            "ended_at_force_limit": loaded.force_limited,
+            "data_digest": data_digest(loaded.raw)[:16],
         }
     )
     for key, value in spec.numeric_params().items():
@@ -198,12 +205,39 @@ def _order_columns(frame: pd.DataFrame) -> pd.DataFrame:
         "modulus_MPa", "plateau_stress_MPa", "densification_strain",
         "energy_absorption_MJ_m3", "sea_J_per_g",
         "first_peak_stress_MPa", "crush_force_N", "max_stress_MPa",
+        "ended_at_force_limit",
     ]
-    tail = ["raw_file", "pattern_params", "diagnostics"]
+    tail = ["raw_file", "pattern_params", "data_digest", "diagnostics"]
     lead = [c for c in lead if c in frame.columns]
     tail = [c for c in tail if c in frame.columns]
     middle = [c for c in frame.columns if c not in lead and c not in tail]
     return frame[lead + middle + tail]
+
+
+def data_digest(raw: pd.DataFrame) -> str:
+    """Hash of a test's measurements, ignoring how the file was written.
+
+    Hashing the *parsed columns* rather than the file bytes is deliberate: the
+    instrument re-exports the same test with and without the boilerplate
+    header, so two byte-different files can hold identical measurements.
+    """
+    payload = raw[["time_s", "disp_mm", "force_kN"]].to_csv(index=False)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def group_duplicates(digests: dict[str, str]) -> list[list[str]]:
+    """Groups of test_ids whose measurements are identical.
+
+    Registered as separate rows these masquerade as replicates and manufacture
+    a spread that no second specimen ever produced.
+    """
+    by_digest: dict[str, list[str]] = {}
+    for test_id, digest in digests.items():
+        by_digest.setdefault(digest, []).append(test_id)
+    return sorted(
+        (sorted(ids) for ids in by_digest.values() if len(ids) > 1),
+        key=lambda ids: ids[0],
+    )
 
 
 def run_analysis(
@@ -256,6 +290,30 @@ def run_analysis(
     metrics = _order_columns(pd.DataFrame(rows)).sort_values(
         ["pattern_name", "replicate", "test_id"]
     )
+
+    # Identical measurements registered under two test_ids are not replicates.
+    for group in group_duplicates(
+        {str(r["test_id"]): str(r["data_digest"]) for r in rows}
+    ):
+        message = (
+            f"identical measurements to {', '.join(group)} -- these are the same "
+            f"test exported more than once, not separate specimens. Registering "
+            f"them as replicates fabricates the spread between them; remove all "
+            f"but one from specimens.csv."
+        )
+        for test_id in group:
+            diag_rows.append(
+                {
+                    "test_id": test_id,
+                    "pattern_name": next(
+                        (r["pattern_name"] for r in rows if r["test_id"] == test_id), ""
+                    ),
+                    "level": "warning",
+                    "code": "duplicate_test_data",
+                    "message": message,
+                }
+            )
+
     diagnostics = pd.DataFrame(
         diag_rows, columns=["test_id", "pattern_name", "level", "code", "message"]
     )

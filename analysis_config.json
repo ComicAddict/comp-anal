@@ -1,0 +1,5 @@
+{
+  "force_limit_kN": 9.5,
+
+  "_comment": "Project defaults, loaded automatically by scripts/run_analysis.py and scripts/plot_envelope.py unless --config points elsewhere. Any field of src.config.AnalysisConfig can be set here; anything omitted keeps its documented default. force_limit_kN is the load limit the 10 kN frame was configured to stop at, so tests that terminate against it are flagged as truncated."
+}

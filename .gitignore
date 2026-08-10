@@ -1,0 +1,20 @@
+# Generated analysis outputs. Everything under results/ is reproducible by
+# re-running scripts/run_analysis.py, so it is not tracked. The directory is
+# created on demand by the pipeline.
+results/
+
+# Synthetic demo tree from scripts/make_demo_data.py -- regenerate on demand.
+demo/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

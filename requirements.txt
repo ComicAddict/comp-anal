@@ -1,0 +1,8 @@
+# Core analysis stack.
+numpy>=1.24        # np.trapezoid is used when available, np.trapz otherwise
+pandas>=2.0
+scipy>=1.10        # peak finding (signal.find_peaks), convex hull (spatial)
+matplotlib>=3.7
+
+# Tests.
+pytest>=7.0

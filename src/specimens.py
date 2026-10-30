@@ -40,6 +40,14 @@ COLUMNS: tuple[str, ...] = (
     "notes",
 )
 
+#: Core columns that may be absent from older files. When present they are
+#: part of the schema (not parameters); when absent they read as blank.
+OPTIONAL_COLUMNS: tuple[str, ...] = ("print_date",)
+
+#: Core columns holding a date, or a date and time. ISO format
+#: (2026-07-17 19:22) is the safe choice: 07/08/2026 reads as 8 July.
+DATE_COLUMNS: tuple[str, ...] = ("print_date", "test_date")
+
 #: Columns that must be present AND non-null for every row.
 REQUIRED_NON_NULL: tuple[str, ...] = (
     "test_id",
@@ -93,8 +101,11 @@ class Specimen:
     test_date: str | None = None
     notes: str | None = None
     #: Values from any extra columns in specimens.csv, keyed by sanitised
-    #: column name. Numeric columns arrive as floats, the rest as strings.
+    #: column name: floats for numeric columns, Timestamps for date columns,
+    #: strings for the rest.
     extra_params: dict[str, Any] = field(default_factory=dict)
+    #: When the specimen was printed (date, or date and time).
+    print_date: str | None = None
 
     @property
     def volume_mm3(self) -> float:
@@ -121,6 +132,21 @@ class Specimen:
                 out[key] = float(value)
         return out
 
+    def datetime_params(self) -> dict[str, pd.Timestamp]:
+        """Parameters whose values are dates or times."""
+        return {k: v for k, v in self.parameters().items() if isinstance(v, pd.Timestamp)}
+
+    def print_to_test_days(self) -> float | None:
+        """Days between printing and testing, when both dates are known.
+
+        PLA keeps changing after printing -- it ages physically and takes up
+        moisture -- so the interval is a candidate cause in its own right.
+        """
+        printed, tested = parse_date(self.print_date), parse_date(self.test_date)
+        if printed is None or tested is None:
+            return None
+        return (tested - printed).total_seconds() / 86400.0
+
     def categorical_params(self) -> dict[str, str]:
         """Parameters whose values are labels (text or true/false)."""
         out: dict[str, str] = {}
@@ -130,6 +156,52 @@ class Specimen:
             elif isinstance(value, str) and value.strip():
                 out[key] = value.strip()
         return out
+
+
+def parse_date(value: Any) -> pd.Timestamp | None:
+    """One cell as a Timestamp, or None when blank or not a date."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    if not text or not re.search(r"\d", text):
+        return None
+    try:
+        stamp = pd.to_datetime(text, format="mixed")
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if pd.isna(stamp):
+        return None
+    # Wall-clock time, as in parse_datetimes: a "Z" on one date must not make
+    # it incomparable with a plain date in the other column.
+    return stamp.tz_localize(None) if stamp.tzinfo is not None else stamp
+
+
+def parse_datetimes(series: pd.Series) -> pd.Series | None:
+    """A whole column as datetimes, or None if it is not a date column.
+
+    Every filled cell must parse. Numbers are never dates (20260717 stays a
+    number), and every cell needs a digit, since dateutil happily reads "May"
+    as a date in the year 1.
+    """
+    present = series.notna() & (series.astype(str).str.strip() != "")
+    if not present.any():
+        return None
+    cells = series[present].astype(str).str.strip()
+    if pd.to_numeric(cells, errors="coerce").notna().all():
+        return None
+    if not cells.str.contains(r"\d").all():
+        return None
+    try:
+        parsed = pd.to_datetime(cells, errors="coerce", format="mixed")
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if not pd.api.types.is_datetime64_any_dtype(parsed) or parsed.isna().any():
+        return None
+    if getattr(parsed.dt, "tz", None) is not None:
+        parsed = parsed.dt.tz_localize(None)
+    out = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    out.loc[present] = parsed.to_numpy()
+    return out
 
 
 def _parse_params(raw: Any, test_id: str) -> dict[str, Any]:
@@ -192,12 +264,13 @@ def validate_frame(frame: pd.DataFrame, raw_dir: Path | None = None) -> pd.DataF
     """Validate the specimens table. Raises `SpecimenError` on any problem.
 
     Checks, in order: required columns exist, required cells are non-null,
-    numeric columns parse, test_ids are unique, and (if `raw_dir` is given)
-    every referenced raw file exists on disk.
+    numeric and date columns parse, no test predates its print, test_ids are
+    unique, and (if `raw_dir` is given) every referenced raw file exists on
+    disk.
     """
     problems: list[str] = []
 
-    missing_cols = [c for c in COLUMNS if c not in frame.columns]
+    missing_cols = [c for c in COLUMNS if c not in frame.columns]  # optional ones may be absent
     if missing_cols:
         raise SpecimenError(
             f"specimens.csv is missing required column(s): {missing_cols}. "
@@ -240,6 +313,31 @@ def validate_frame(frame: pd.DataFrame, raw_dir: Path | None = None) -> pd.DataF
             except ValueError:
                 problems.append(
                     f"row {idx + 2}: '{col}' must be numeric, got {text!r}"
+                )
+
+    # Date columns must hold dates.
+    for col in DATE_COLUMNS:
+        if col not in frame.columns:
+            continue
+        for idx, value in frame[col].items():
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                continue
+            text = str(value).strip()
+            if text and parse_date(text) is None:
+                problems.append(
+                    f"row {idx + 2}: '{col}' is not a date: {text!r} "
+                    f"(use e.g. 2026-07-17 or 2026-07-17 19:22)"
+                )
+
+    # A specimen cannot be tested before it was printed. Usually two swapped
+    # cells, and it would enter the analysis as a negative age.
+    if "print_date" in frame.columns:
+        for idx, row in frame.iterrows():
+            printed, tested = parse_date(row["print_date"]), parse_date(row["test_date"])
+            if printed is not None and tested is not None and tested < printed:
+                problems.append(
+                    f"row {idx + 2}: test_date ({str(row['test_date']).strip()}) is before "
+                    f"print_date ({str(row['print_date']).strip()}); check the two dates"
                 )
 
     # Unique test_id.
@@ -290,7 +388,7 @@ def extra_parameter_columns(frame: pd.DataFrame) -> dict[str, str]:
     """
     mapping: dict[str, str] = {}
     for column in frame.columns:
-        if column in COLUMNS or str(column).startswith("Unnamed:"):
+        if column in COLUMNS or column in OPTIONAL_COLUMNS or str(column).startswith("Unnamed:"):
             continue
         key = sanitise_name(column)
         if not key:
@@ -325,8 +423,21 @@ def _numeric_columns(frame: pd.DataFrame, columns: list[str]) -> set[str]:
     return numeric
 
 
+def _datetime_columns(frame: pd.DataFrame, columns: list[str]) -> dict[str, pd.Series]:
+    """Non-numeric columns whose every filled cell is a date or time."""
+    found: dict[str, pd.Series] = {}
+    for column in columns:
+        parsed = parse_datetimes(frame[column])
+        if parsed is not None:
+            found[column] = parsed
+    return found
+
+
 def _extra_values(
-    row: pd.Series, mapping: dict[str, str], numeric: set[str]
+    row: pd.Series,
+    mapping: dict[str, str],
+    numeric: set[str],
+    dates: dict[str, pd.Series],
 ) -> dict[str, Any]:
     values: dict[str, Any] = {}
     for column, key in mapping.items():
@@ -336,7 +447,12 @@ def _extra_values(
         text = str(cell).strip()
         if not text:
             continue
-        values[key] = float(text) if column in numeric else text
+        if column in numeric:
+            values[key] = float(text)
+        elif column in dates:
+            values[key] = pd.Timestamp(dates[column].loc[row.name])
+        else:
+            values[key] = text
     return values
 
 
@@ -365,6 +481,7 @@ def to_specimens(frame: pd.DataFrame) -> list[Specimen]:
     """
     mapping = extra_parameter_columns(frame)
     numeric = _numeric_columns(frame, list(mapping))
+    dates = _datetime_columns(frame, [c for c in mapping if c not in numeric])
 
     out: list[Specimen] = []
     for _, row in frame.iterrows():
@@ -380,7 +497,7 @@ def to_specimens(frame: pd.DataFrame) -> list[Specimen]:
             raise SpecimenError(f"[{test_id}] initial_height_mm must be > 0")
 
         json_params = _parse_params(row.get("pattern_params"), test_id)
-        extra = _extra_values(row, mapping, numeric)
+        extra = _extra_values(row, mapping, numeric, dates)
         conflicts = _merge_conflicts(json_params, extra)
         if conflicts:
             raise SpecimenError(
@@ -405,6 +522,7 @@ def to_specimens(frame: pd.DataFrame) -> list[Specimen]:
                 test_date=_opt_str(row.get("test_date")),
                 notes=_opt_str(row.get("notes")),
                 extra_params=extra,
+                print_date=_opt_str(row.get("print_date")),
             )
         )
     return out

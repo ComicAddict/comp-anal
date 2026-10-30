@@ -483,6 +483,7 @@ def plot_metric_space(
     hull: bool = True,
     labels: dict[str, str] | None = None,
     color_by: str | None = None,
+    color_label: str | None = None,
 ) -> Path | None:
     """Scatter two metrics against each other, one point per test.
 
@@ -505,7 +506,7 @@ def plot_metric_space(
     spec = color_spec(
         patterns, cfg,
         data[color_col].tolist() if color_col else None,
-        display_name(color_col) if color_col else "",
+        color_label or (display_name(color_col) if color_col else ""),
     )
 
     fig, ax = new_figure((7.5, 6.0))
@@ -563,3 +564,136 @@ class _quiet_nan_warnings:
 
     def __exit__(self, *exc):
         return self._ctx.__exit__(*exc)
+
+
+# ----------------------------------------------------------------------
+# Densification check
+# ----------------------------------------------------------------------
+@dataclass
+class DensificationTrace:
+    """Energy-efficiency diagnostics along one curve, on a uniform grid."""
+
+    test_id: str
+    strain: np.ndarray
+    stress: np.ndarray
+    efficiency: np.ndarray      # eta = W / sigma
+    ratio: np.ndarray           # r = (dsigma/deps) * W / sigma^2
+
+    @property
+    def final_ratio(self) -> float:
+        finite = self.ratio[np.isfinite(self.ratio)]
+        return float(np.median(finite[-5:])) if finite.size else float("nan")
+
+    @property
+    def reached(self) -> bool:
+        return bool(np.nanmax(self.ratio[len(self.ratio) // 10:]) >= 1.0)
+
+
+def densification_trace(
+    curve: StressStrainCurve, cfg: AnalysisConfig = DEFAULT_CONFIG, n_points: int = 400
+) -> DensificationTrace | None:
+    """How close a curve came to densification, by the energy-efficiency rule.
+
+    The energy efficiency eta = W / sigma peaks -- densification onset -- where
+    d(eta)/d(eps) = 1 - r = 0, with r = (dsigma/deps) * W / sigma^2. So r is a
+    progress gauge: exactly 1/2 in the linear-elastic region, low after
+    yield, climbing through a hardening plateau, and densification where it
+    crosses 1. Computed on a uniform resample with a Savitzky-Golay derivative,
+    which is smooth enough for a ratio and fast on 17,000-sample exports.
+    """
+    from scipy.signal import savgol_filter
+
+    from .mechanics import cumulative_energy
+
+    top = float(np.nanmax(curve.strain)) if len(curve.strain) else float("nan")
+    if not np.isfinite(top) or top <= 0 or len(curve.strain) < 10:
+        return None
+    grid = np.linspace(0.0, top, n_points)
+    stress = resample_curve(curve.strain, curve.stress_MPa, grid)
+    keep = np.isfinite(stress)
+    if keep.sum() < 20:
+        return None
+    grid, stress = grid[keep], stress[keep]
+
+    step = float(grid[1] - grid[0])
+    window = max(7, int(round(2 * cfg.tangent_window_strain / step)) | 1)
+    window = min(window, (len(grid) // 2) * 2 - 1)
+    slope = savgol_filter(stress, window, 2, deriv=1, delta=step)
+    work = cumulative_energy(grid, stress)
+    usable = stress > 0.05 * float(np.nanmax(stress))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        efficiency = np.where(usable, work / stress, np.nan)
+        ratio = np.where(usable, slope * work / stress**2, np.nan)
+    return DensificationTrace(curve.test_id, grid, stress, efficiency, ratio)
+
+
+def plot_densification_check(
+    curves: Sequence[StressStrainCurve],
+    out_path: str | Path,
+    cfg: AnalysisConfig = DEFAULT_CONFIG,
+    load_limited: bool = False,
+) -> Path | None:
+    """Stress, energy efficiency and the densification gauge r, per test.
+
+    Answers "did these tests reach densification, and if not, how close did
+    they get?" -- which a single flagged number cannot.
+    """
+    traces = [t for c in curves if (t := densification_trace(c, cfg)) is not None]
+    if not traces:
+        return None
+
+    spec = color_spec([t.test_id for t in traces], cfg)
+    many = spec.mode == "single"
+    alpha = float(np.clip(3.0 / np.sqrt(len(traces)), 0.2, 0.9)) if many else 0.9
+
+    fig, axes = plt.subplots(3, 1, figsize=(8.5, 9.0), sharex=True, layout="constrained")
+    fig.patch.set_facecolor(SURFACE)
+    for trace, color in zip(traces, spec.colors):
+        label = None if many else trace.test_id
+        axes[0].plot(trace.strain, trace.stress, color=color, linewidth=1.1, alpha=alpha, label=label)
+        axes[1].plot(trace.strain, trace.efficiency, color=color, linewidth=1.1, alpha=alpha)
+        axes[2].plot(trace.strain, trace.ratio, color=color, linewidth=1.1, alpha=alpha)
+        axes[2].plot(trace.strain[-1], trace.ratio[np.isfinite(trace.ratio)][-1],
+                     marker="o", color=color, markersize=4, alpha=min(1.0, alpha + 0.2))
+
+    onset = axes[2].axhline(1.0, color=INK, linewidth=1.2, linestyle="--",
+                            label="densification onset (r = 1)")
+    elastic = axes[2].axhline(0.5, color=INK_MUTED, linewidth=0.8, linestyle=":",
+                              label="linear-elastic loading (r = ½)")
+    axes[2].set_ylim(0, 1.5)
+    # A legend rather than inline labels: "best" placement keeps it off the
+    # curves, wherever a given dataset happens to put them.
+    style_legend(axes[2].legend(handles=[onset, elastic], frameon=False, fontsize=8, loc="best"))
+
+    finals = np.array([t.final_ratio for t in traces])
+    reached = sum(t.reached for t in traces)
+    style_axes(axes[0], "", "", "Stress (MPa)")
+    style_axes(axes[1], "", "", "Energy efficiency η = W/σ")
+    style_axes(axes[2], "", "Engineering strain (mm/mm)", "Progress to densification r")
+    if not many:
+        # Bottom right is empty on a stress-strain plot: low stress, high strain.
+        style_legend(axes[0].legend(frameon=False, fontsize=8, loc="lower right"))
+
+    verdict = (
+        f"{reached} of {len(traces)} tests reached densification (r ≥ 1)"
+        if reached
+        else f"none of the {len(traces)} tests reached densification"
+    )
+    if reached < len(traces):
+        unfinished = finals[[not t.reached for t in traces]]
+        who = "they stop" if not reached else "the others stop"
+        verdict += (
+            f"; {who} at r = {np.nanmin(unfinished):.2f}–{np.nanmax(unfinished):.2f}"
+            + (", cut off by the load limit" if load_limited else "")
+        )
+    fig.suptitle("Did the tests reach densification?", x=0.01, ha="left", fontsize=12, color=INK)
+    axes[0].set_title(verdict, loc="left", fontsize=9, color=INK_SECONDARY, pad=8)
+    fig.text(
+        0.01, -0.01,
+        "r = (dσ/dε)·W/σ² is where the energy-efficiency rule stands: η = W/σ keeps rising while "
+        "r < 1 and peaks (densification onset) where r = 1.\n"
+        "r sits at ½ through linear-elastic loading, drops after yield, and climbs as the "
+        "specimen hardens. Dots mark where each test ends.",
+        fontsize=8, color=INK_MUTED, ha="left", va="top",
+    )
+    return save_figure(fig, out_path, cfg)

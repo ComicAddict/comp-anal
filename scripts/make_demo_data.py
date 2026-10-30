@@ -6,9 +6,10 @@
     python scripts/run_analysis.py --root demo --force --color-by relative_density
 
 Everything this writes is SYNTHETIC: 64 distinct patterns (cell size x wall
-thickness x topology) each printed with its own layer height, print speed and
-nozzle temperature, in the instrument's export format and stopped at the same
-9.5 kN load limit as the real frame. Nothing here is measured data; delete
+thickness x topology), each printed with its own layer height, print speed and
+nozzle temperature, in one of four print batches at one of eight build-plate
+positions, with print and test timestamps -- in the instrument's export format
+and stopped at the same 9.5 kN load limit as the real frame. Nothing here is measured data; delete
 `demo/` once your own tests are in `data/raw/`.
 
 Because the causes are planted, the demo doubles as a check on the
@@ -29,7 +30,7 @@ import json
 import shutil
 from pathlib import Path
 
-from src.specimens import COLUMNS
+from src.specimens import COLUMNS, OPTIONAL_COLUMNS
 from src.synthetic import PLANTED_TRUTH, SyntheticTest, planted_curve_spec, planted_design
 
 __doc__ = __doc__.format(truth=PLANTED_TRUTH)
@@ -41,6 +42,8 @@ PARAMETER_COLUMNS = (
     "layer_height_mm",
     "print_speed_mm_s",
     "nozzle_temp_C",
+    "print_batch",
+    "bed_position",
 )
 
 
@@ -81,7 +84,8 @@ def build(
             "relative_density": row["relative_density"],
             "mass_g": row["mass_g"],
             "material": row["material"],
-            "test_date": "2026-08-01",
+            "test_date": row["test_date"],
+            "print_date": row["print_date"],
             "notes": "SYNTHETIC demo data -- not a real measurement",
         }
         record.update({column: row[column] for column in PARAMETER_COLUMNS})
@@ -89,7 +93,9 @@ def build(
 
     specimens = root / "data" / "specimens.csv"
     with specimens.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(COLUMNS) + list(PARAMETER_COLUMNS))
+        writer = csv.DictWriter(
+            handle, fieldnames=list(COLUMNS) + list(OPTIONAL_COLUMNS) + list(PARAMETER_COLUMNS)
+        )
         writer.writeheader()
         writer.writerows(rows)
 

@@ -5,7 +5,7 @@ negative-volume internal patterns. Raw instrument CSVs go in; engineering
 stress–strain curves, standard cellular-solid metrics, and design-space
 envelope figures come out.
 
-Two questions this is built to answer:
+Three questions this is built to answer:
 
 1. **Per pattern** — how stiff is it, where does it plateau, when does it
    densify, how much energy does it absorb?
@@ -13,16 +13,16 @@ Two questions this is built to answer:
    mechanical response is achievable, and how much of that spread is
    pattern-to-pattern rather than replicate-to-replicate noise?
 3. **What drives it** — do the design and manufacturing parameters (cell size,
-   wall thickness, layer height, print orientation, …) correlate with the
-   measured properties, and which ones genuinely matter once the others are
-   accounted for?
+   wall thickness, layer height, print batch, position on the build plate,
+   print and test dates, …) correlate with the measured properties, and which
+   ones genuinely matter once the others are accounted for?
 
 ---
 
 ## Quickstart
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 
 # 0. Check what a new export actually contains (no metadata needed).
 python scripts/inspect_raw.py --duplicates
@@ -54,8 +54,9 @@ automatically. It currently records the 9.5 kN load limit:
 
 **Want to see it work before you have data registered?** Generate a synthetic
 64-pattern design space — cell size × wall thickness × topology, each printed
-with its own layer height, print speed and nozzle temperature, stopped at the
-same 9.5 kN limit — and run the whole pipeline on it:
+with its own layer height, print speed and nozzle temperature, in one of four
+print batches at one of eight build-plate positions, with print and test dates,
+and stopped at the same 9.5 kN limit — and run the whole pipeline on it:
 
 ```bash
 python scripts/make_demo_data.py            # writes demo/ (synthetic, disposable)
@@ -126,9 +127,11 @@ of a run.
 
 ### Load-limited (truncated) tests
 
-All five current tests **stop against the 9.5 kN limit rather than densifying.**
-The frame runs out of load before the specimen runs out of behaviour, so the
-curve is cut off partway.
+All four current tests **stop against the 9.5 kN limit before densifying** —
+37.1 MPa on a 16 mm cube, reached at 29–36% strain. The frame runs out of load
+before the specimen runs out of behaviour, so the curve is cut off partway.
+`figures/densification_check.png` shows how far short each test stopped (see
+*Onset of densification*).
 
 This is detected two ways: explicitly against `force_limit_kN`, and — with no
 configuration at all — from the fact that the file *ends at its own maximum
@@ -184,12 +187,15 @@ One row per test. See `data/specimens.example.csv` for a filled-in example.
 | `relative_density` | | specimen / bulk material density |
 | `mass_g` | | enables SEA per unit mass; without it SEA is reported per unit volume |
 | `material` | ✔ | build material |
-| `test_date` | | defaulted from a `_YYYYMMDD_` stamp in the filename |
+| `test_date` | | when the test ran — a date or date-time (`2026-07-17`, `2026-07-17 19:22`). Defaulted from a `_YYYYMMDD_` stamp in the filename, which is the *export* time: replace it with the real one |
 | `notes` | | free text |
+| `print_date` | | when the specimen was printed, same formats. With both dates, the specimen's age at test is derived as `print_to_test_days` |
 
-All columns must **exist**; the ticked ones must also be **non-null**. Validation
-runs before any analysis, and reports every problem at once with row numbers —
-it does not fail on the first one.
+All columns must **exist** — except `print_date`, which can be left out until
+you have it (`register_test.py` adds the column the first time it is given one)
+— and the ticked ones must also be **non-null**. Validation runs before any
+analysis, and reports every problem at once with row numbers — it does not fail
+on the first one. A test dated before its print is one of those problems.
 
 ### Design and manufacturing parameters: just add columns
 
@@ -220,29 +226,91 @@ flags, and refuses duplicate `test_id`s and malformed JSON at entry time.
 `test_id` and `test_date` from the filename and marking duplicate re-exports in
 `notes`, leaving pattern and geometry to enter by hand.
 
+### Print time, test time, batch and bed position
+
+These are recorded like any other parameter, and get some special handling:
+
+| column | record as | catches |
+|---|---|---|
+| `print_date` | date or date-time (core column) | drift across the print campaign: filament moisture, nozzle wear, recalibration |
+| `test_date` | date or date-time (core column) | drift across the test campaign |
+| `print_batch` | a label: `B1`, `plate_0715_a`, … | a one-off bad batch, which no time trend can see |
+| `bed_position` | a label: `R1C3`, `front_left`, … | particular spots on the plate behaving differently |
+
+- **Dates are analysed as elapsed time** — days since the earliest — so the
+  question is "does it matter how late in the campaign?". Figures label the axis
+  that way. The gap between the two dates becomes `print_to_test_days`: PLA
+  keeps taking up moisture and ageing physically after printing, so a
+  specimen's age at test is a parameter in its own right.
+- **The three cannot all be analysed together**, because test date = print
+  date + age, exactly. With all three present `test_date` is left out and the
+  summary says so; `correlate.py --parameters` analyses it in place of one of
+  the others.
+- **Batch and print date will usually be confounded**, since a batch is printed
+  on one day. Parameters this entangled (association ≥ 0.8) are reported as
+  confounded, and neither is held fixed when testing the other — that would
+  cancel both. A shared result is one effect with two names. They are not
+  interchangeable, though: in the demo, batch B3 is weak, and the batch label
+  finds it while print date shows nothing, because B3 being the third of four
+  print days is not a trend. The same check covers design parameters: if every
+  large-cell pattern went into batch 1, cell size and batch are reported as
+  confounded. Spreading patterns across batches, and batches across days, is
+  what lets the data tell them apart.
+- **Bed position: a label, numbers, or both.** A label treats each spot as a
+  level of its own, and a spot needs at least 3 tests to take part. If you
+  suspect a *gradient* (warping, one edge of the bed running cooler), add
+  numeric `bed_x_mm` and `bed_y_mm` columns as well. If you suspect centre
+  versus edge, a `bed_r_mm` column — distance from the plate centre — turns it
+  into a single trend, which is the most sensitive test of the three.
+
 ### Current state of the real data
 
-`data/specimens.csv` is a template covering the five exports in `data/raw/`,
-with geometry left blank — **the analysis will not run until it is filled in**,
-and says exactly which columns are missing if you try. What is still needed:
+`data/specimens.csv` registers the four distinct tests in `data/raw/` as 16 mm
+PLA cubes at relative density 0.8. `_5_2` is a byte-identical re-export of
+`_5_1`, so it is left out; its raw file stays in place. At the 9.5 kN limit a
+16 × 16 mm face reaches 37.1 MPa.
 
-- **`side_length_mm` and `initial_height_mm`.** Nothing in the raw files records
-  specimen size, and without it displacement cannot become strain. Worth a
-  sanity check when you fill it: at 9.5 kN a 20 mm cube sees only ~24 MPa, and
-  the yield knee in these curves sits near ~14 MPa, which is low for solid PLA.
-- **`pattern_name` and `replicate`.** The filenames suffix `_1_1`, `_2_1`,
-  `_4_1`, `_5_1`, `_5_2` (no `_3_1`), but per the brief nothing is inferred from
-  them. Note `_5_1` and `_5_2` are the same test exported twice — delete one row
-  unless it really is a second specimen.
-- **`material`**, and optionally `mass_g` to get SEA per unit mass.
-- **Your design and manufacturing parameters**, one column each (see above),
-  for the correlation analysis to use.
+| test | E (MPa) | plateau σ, 20–30% (MPa) | σ at 10% (MPa) | σ at 20% (MPa) | W to 20% (MJ/m³) | strain at cut-off |
+|---|---|---|---|---|---|---|
+| `_1_1` | 659 | 33.5 | 26.1 | 30.4 | 4.72 | 29.0% |
+| `_2_1` | 625 | 29.1 | 22.7 | 26.3 | 4.14 | 35.5% |
+| `_4_1` | 603 | 28.9 | 21.9 | 25.7 | 4.00 | 34.9% |
+| `_5_1` | 594 | 28.5 | 21.9 | 25.4 | 3.93 | 35.7% |
 
-What to expect from the analysis once geometry is in: on a 20 mm specimen these
-tests stop at 23–29% strain, before densification. Plateau stress (20–30%
-window) will mostly be withheld and energy-to-densification flagged as a lower
-bound — so **σ at 10%, σ at 20% and W to 20% are the properties to correlate
-against** for this data. They are defined for all four unique tests.
+- **None of the four reached densification.** The gauge r (see *Onset of
+  densification*) ends at 0.50–0.62 where onset is r = 1: at the cut-off the
+  curves stiffen at about 90 MPa, and onset needs 154–178 MPa. Extrapolating r
+  linearly puts onset near 50–60% strain at 55 MPa or more, which is at least
+  14 kN on this face; extrapolating the stress curve's current shape, r never
+  reaches 1. The curves look like a dense solid yielding and hardening, as
+  expected with so little void space, not a foam collapsing and locking up.
+  Seeing densification
+  would take a smaller cross-section (a 12 mm cube reaches 66 MPa at 9.5 kN, at
+  the cost of fewer cells across it) or a bigger frame.
+- So **ε_D and energy to densification are lower bounds**, and are left out of
+  the correlation. Modulus, plateau stress, σ at 10% and 20%, and W to 20% are
+  complete for all four tests.
+- **`_1_1` is the odd one out.** It is about 8% stiffer and 16–18% stronger
+  than the other three, which agree within 5%. It is not seating: toe
+  compensation leaves E unchanged and moves the stresses by about 1%. Whether
+  it is a different pattern or a stronger print is for the metadata to say.
+- **Relative density 0.8 is a reading of "0.8 density".** If it meant
+  0.8 g/cm³, then against ~1.24 g/cm³ for solid PLA, ρ\* ≈ 0.65. It is the same
+  for every test either way, so it does not move the correlations. Weighing the
+  cubes into `mass_g` settles it, and gives SEA per gram.
+
+Still to fill in before the correlation analysis has anything to work with:
+
+- **`pattern_name`** — currently placeholders taken from the filename
+  (`pattern_1`, …).
+- **`print_date`**, and the real **`test_date`**: the filename stamp is a single
+  export time shared by all four files.
+- **`print_batch`** and **`bed_position`**.
+- **One column per design parameter** of the patterns (cell size, wall
+  thickness, …).
+
+When there is nothing to correlate, `run_analysis.py` lists which columns are
+still blank and which are the same for every test.
 
 ---
 
@@ -274,6 +342,15 @@ and 10 samples wide is scored by R².
 
 Also reported: `modulus_r2`, the fitted strain window, and `toe_strain` (where
 the fitted line crosses zero stress — a measure of seating slack).
+
+**Absolute values include the frame.** The export has no extensometer channel,
+so `Displacement` is crosshead travel, and the stiffness measured is the
+specimen's in series with the frame, load cell and platens. E therefore comes
+out below the specimen's own, by an amount set by the frame. Within one
+specimen size the correction is the same monotonic function for every test, so
+the *order* of the tests is preserved and rank correlations are unaffected. For
+an absolute modulus, measure the frame's compliance (platens together, or a
+steel block) and subtract it.
 
 ### Plateau stress
 Mean stress between `plateau_strain_lo` and `plateau_strain_hi`, with the
@@ -309,6 +386,17 @@ If the criterion is only met within 1% strain of the end of the data, the test
 probably stopped before real densification: the value is flagged
 `densification_at_end_of_data` (and `densification_censored`) and should be
 read as a lower bound.
+
+**How close did a test get?** A flag says that a test stopped short;
+`figures/densification_check.png` says by how much. It plots stress, η, and the
+gauge
+
+    r = (dσ/dε) · W / σ²
+
+for every test. Since dη/dε = 1 − r, η rises while r < 1 and peaks, which is
+densification onset, exactly where r crosses 1. r is ½ through linear-elastic
+loading, drops after yield, and climbs as the specimen hardens. The subtitle
+gives the verdict, and a dot marks where each test ends.
 
 ### Energy absorption and SEA
 `W = ∫₀^εd σ dε` by trapezoidal integration to the densification strain (falling
@@ -361,9 +449,9 @@ How the curves are coloured depends on how many patterns there are:
   drawn as a plain curve in one colour, with the **middle-50% band** and the
   **median curve** on top. The legend has four entries, not 64.
 - **`--color-by <parameter>`** — curves coloured on a continuous scale by a
-  numeric parameter (with a colorbar), or by the levels of a categorical one. If
-  the colour gradient lines up with curve height, that parameter orders the
-  response: a visual correlation.
+  numeric parameter (with a colorbar), or by the levels of a categorical one. A
+  date colours by days since the earliest. If the colour gradient lines up with
+  curve height, that parameter orders the response: a visual correlation.
 
 The grid runs to the **shortest** test's maximum strain, so every curve is
 defined at every grid point and the envelope is real rather than an artefact of
@@ -374,6 +462,11 @@ curves ending at different strains. The subtitle names that cap; use
 Each derived metric against another, one point per test, with a convex hull
 marking the achievable property region. Colouring follows the same rule as the
 overlay; every test is the same plain circle.
+
+### (c) `densification_check.png`
+Stress, energy efficiency and the densification gauge r for every test, with
+the verdict in the subtitle — see *Onset of densification*. Above 8 tests the
+curves go to one colour, as in the overlay.
 
 **Chart conventions.** One marker shape throughout. Categorical colour comes
 from a fixed, colourblind-validated order and is used only when there are few
@@ -398,17 +491,20 @@ pattern) is tested against every property in `correlation_properties`.
 | **False-discovery-rate control** (Benjamini–Hochberg) → a q-value per pair | Screening 7 parameters × 10 properties at p < 0.05 would produce ~4 "significant" associations from noise alone. Only q < 0.05 is called significant. |
 | **Partial ρ**: the same correlation with every *other* parameter held fixed | In a real design, parameters move together. Strong pairwise / weak partial means *borrowed from a correlated parameter*. Weak pairwise / strong partial means *a real effect masked by a bigger one*. |
 | Categorical factors are held fixed in the partials too | Leaving one out is not neutral. In the demo, before this, cell size's partial with modulus came out at **+0.69** — "bigger cells are stiffer at equal density" — because at fixed density a bigger cell implied the stiffer topology. |
-| **Collinearity** (rank-space VIF per parameter, Spearman between parameters) | A parameter predictable from the others (VIF ≥ 10) has no separable effect in this data; its partial is withheld rather than reported wrong. |
+| **Collinearity**: a VIF per parameter, from ranks *and* logs | A parameter predictable from the others (VIF ≥ 10) has no separable effect in this data; its partial is withheld rather than reported wrong. Logs matter because derived parameters are usually ratios: ρ\* = k·wall/cell is exact in logs but not in ranks. Ranks alone (R² = 0.77) passed topology as separable when the other three fixed it. |
+| **Confounding** between every two parameters: \|Spearman ρ\| for two numeric, correlation ratio η for numeric–categorical, Cramér's V for two categorical | Pairs at ≥ 0.8 are reported as confounded, and are not held fixed for each other, since that would erase both effects. |
 | **Kruskal–Wallis + ε²** for categorical factors | Levels with fewer than 3 tests are left out; a factor that is unique per test (64 different pattern names) cannot be tested and is reported as such. |
+| **Quade's rank ANCOVA + partial η²**, the categorical partial | Ranks the property, takes out what the other parameters explain, and compares the levels on what is left. In the demo, a 12% batch defect is invisible next to the 30× density spread (ε² = 0.02, not significant) and plain once density is held fixed (partial η² = 0.33, q = 0.002). |
 | **Gibson–Ashby scaling** vs relative density: one exponent, a prefactor per categorical level, plus each level fitted alone | The exponent separates bending-dominated (E ∝ ρ\*², σ ∝ ρ\*^1.5) from stretch-dominated (∝ ρ\*) architectures. The per-level prefactor matters: pooling a denser-*and*-stronger topology with a weaker one tilts the slope — in the demo, pooled strength gave 1.62, "steeper than either mode"; with per-topology prefactors, 1.51 against a planted 1.5. |
 | **Censored values excluded** | A lower bound from a load-limited test mostly measures where the test stopped. |
 
 ### Outputs
 
 `results/correlation/` — `correlations.csv` (one row per parameter × property:
-ρ with 95% CI, p, q, partial ρ and its q, Pearson r, ε², n, how many lower bounds
-were excluded, and a plain-language note), `parameters.csv` (what was analysed,
-VIF, and why anything was not), `collinearity.csv`, `scaling_laws.csv`, and
+ρ with 95% CI, p, q, partial ρ or partial η² and its q, Pearson r, ε², n, how
+many lower bounds were excluded, and a plain-language note), `parameters.csv`
+(what was analysed, VIF, what each is confounded with, the origin of each date
+axis, and why anything was not), `collinearity.csv`, `scaling_laws.csv`, and
 `summary.txt` — the findings in words, also printed at the end of a run.
 
 `results/figures/correlation/`:
@@ -417,11 +513,14 @@ VIF, and why anything was not), `collinearity.csv`, `scaling_laws.csv`, and
   The fastest way to see what matters, and what is borrowed or masked.
 - `property_<name>.png` — that property against every parameter, one panel
   each. Trend line only where significant; a masked effect is labelled as such;
-  hollow points are excluded lower bounds.
-- `collinearity.png` — which parameters move together, with each one's VIF.
-- `categorical_effects.png` — ε² for each categorical factor.
-- `scaling_laws.png` — log-log against relative density, coloured by the first
-  categorical factor, with the Gibson–Ashby reference slopes.
+  hollow points are excluded lower bounds; dates run as days since the earliest.
+- `collinearity.png` — how strongly every two parameters move together (|ρ|, η
+  or Cramér's V, by kind), with each one's VIF; confounded pairs in bold.
+- `categorical_effects.png` — pairwise ε² beside partial η² for each
+  categorical factor. A manufacturing effect hidden behind the pattern
+  differences shows up only in the partial panel.
+- `scaling_laws.png` — log-log against relative density, coloured by the factor
+  whose levels are fitted separately, with the Gibson–Ashby reference slopes.
 
 ### Checked against planted truth
 
@@ -429,14 +528,36 @@ The demo's causes are known, and the analysis recovers them:
 
 | Planted | Found |
 |---|---|
-| Modulus ∝ ρ\*² | n = 1.95 [1.89, 2.02], bending-dominated |
-| Strength ∝ ρ\*^1.5 | n = 1.51 [1.44, 1.57], bending-dominated |
-| Layer height: ±10% — tiny next to density's 30× spread | pairwise ρ = −0.12 (n.s.), **partial ρ = −0.60, q < 0.001** — flagged as masked |
-| Honeycomb 1.3× stiffer than gyroid | ε² = 0.18, q = 0.001 |
-| Print speed, nozzle temperature: **no effect** | not significant for any property, pairwise or partial |
-| Relative density computed from wall ÷ cell | VIF 35 / 19 / 14 — reported as inseparable, partials withheld |
+| Modulus ∝ ρ\*² | n = 2.00 [1.92, 2.07], bending-dominated |
+| Strength ∝ ρ\*^1.5 | n = 1.50 [1.43, 1.57], bending-dominated |
+| Layer height: ±10% — tiny next to density's 30× spread | modulus: pairwise ρ = −0.01 (n.s.), **partial ρ = −0.69, q < 0.001** — flagged as masked |
+| Batch B3 12% weaker | plateau σ: ε² = 0.02 (n.s.), **partial η² = 0.33, q = 0.002** — masked |
+| Edge columns of the bed 15% weaker | modulus: ε² = 0.09 (n.s.), **partial η² = 0.46, q < 0.001** — masked |
+| Each batch printed on one day | batch ~ print date reported as confounded (η = 0.97) |
+| Honeycomb 1.3× stiffer than gyroid | modulus: ε² = 0.16, q = 0.004; partial withheld, since ρ\*, wall and cell fix the topology |
+| Print speed, nozzle temperature, print-to-test age: **no effect** | not significant, apart from one partial on a single property (nozzle temperature → ε_D, q = 0.02). The summary marks it *isolated*: FDR control at 0.05 expects about 1 in 20 discoveries to be false |
+| Relative density computed from wall ÷ cell | VIF 346 / 172 / 137 — reported as inseparable, partials withheld |
 
-These are pinned in `tests/test_correlation.py`.
+The findings — masked, found, confounded, null — are pinned in
+`tests/test_correlation.py`.
+
+### How small an effect it can see
+
+Simulated on the demo design (64 tests, 4 batches of 16, 8 bed positions of 8),
+re-run with 20 seeds:
+
+| planted effect | found by the partial (q < 0.05) |
+|---|---|
+| bed edge 6% weaker | 4 of 20 runs |
+| bed edge 10% weaker | 10 of 20 |
+| bed edge 15% weaker | 18 of 20 |
+| one batch 8% weaker | about half |
+
+So at 64 tests, a ~15% manufacturing effect is caught reliably and a ~10% one
+about half the time. Smaller effects need more tests per level: fewer bed
+positions, or more specimens at each. With no effect present, p < 0.05 comes up
+in 4–7% of simulated tests, close to the nominal 5%, and FDR control acts on
+top of that.
 
 ### Reading it
 
@@ -449,6 +570,9 @@ These are pinned in `tests/test_correlation.py`.
   derived density gone, cell and wall come apart cleanly.
 - To look inside one level of a significant categorical factor:
   `correlate.py --where topology=gyroid`. Subset runs go to their own folder.
+- A real effect usually shows across related properties: strength, energy and
+  modulus together. One that shows on a single property (*isolated* in the
+  summary) is a lead to re-test, not a finding.
 - With few tests per level, a 95% interval will occasionally miss — one in
   twenty by construction.
 
@@ -494,18 +618,17 @@ elastic line passes through the origin, removing seating slack that threshold-
 based contact detection leaves behind. It changes every strain-referenced metric,
 so it is opt-in; `toe_strain` is always reported so you can see what it would do.
 
-Worth trying on this dataset: pre-contact slack ranges from 0.10 mm to 0.89 mm
-across the five tests, and the toe is curved rather than a clean offset, so
-threshold-based contact detection leaves a different amount of seating
-compliance in each specimen. That inflates the apparent spread in modulus
-between nominally identical specimens.
+Pre-contact slack ranges from 0.10 mm to 0.89 mm across the real tests, and the
+toe is curved rather than a clean offset, so it was worth checking. On these
+tests toe compensation leaves E unchanged and moves the stresses by about 1%
+(W to 20% by up to 3%), so seating is not what separates them.
 
 ---
 
 ## Tests
 
 ```bash
-python -m pytest tests/ -q       # 197 tests
+python -m pytest tests/ -q       # 226 tests
 ```
 
 Coverage is aimed at the two things most likely to go quietly wrong: parsing
@@ -577,11 +700,10 @@ Resolutions to the questions raised in the brief, all reversible:
 
 Now that real data has arrived, one more worth settling:
 
-6. **The plateau window may not be reachable.** These tests stop at 5.5–5.9 mm
-   of travel. On a 20 mm specimen that is ~28–30% strain, so the 20–30% plateau
-   window is only just covered and the ISO 20–40% window would not be reachable
-   at all. If the plateau stress matters, either raise the load limit or expect
-   the window to need moving down for this geometry.
+6. **The plateau window is only just reachable.** On the 16 mm cubes these
+   tests stop at 29–36% strain. The 20–30% window is covered (`_1_1` by 90%,
+   the minimum allowed), but the ISO 20–40% window is not. Moving to ISO would
+   need a higher load limit or smaller specimens.
 
 Two additions worth knowing about:
 

@@ -223,3 +223,83 @@ def test_headers_that_collide_after_sanitising_are_rejected(tmp_path):
     path = write_with_extra(tmp_path / "s.csv", ["cell mm", "cell-mm"], [["5", "5"]])
     with pytest.raises(SpecimenError, match="both become parameter"):
         load_specimens(path)
+
+
+# ------------------------------------------------------------------- dates ----
+from src.specimens import parse_date, parse_datetimes  # noqa: E402
+
+
+def test_print_date_column_is_optional(tmp_path):
+    """Files written before print_date existed must still load."""
+    path = write_csv(tmp_path / "specimens.csv", [GOOD_ROW])
+    assert "print_date" not in pd.read_csv(path).columns
+    assert load_specimens(path)[0].print_date is None
+
+
+def test_print_to_test_days(tmp_path):
+    path = write_with_extra(tmp_path / "s.csv", ["print_date"], [["2026-07-10 06:00"]])
+    frame = pd.read_csv(path, dtype=str)
+    frame.loc[0, "test_date"] = "2026-07-17 18:00"
+    frame.to_csv(path, index=False)
+    spec = load_specimens(path)[0]
+    assert spec.print_to_test_days() == pytest.approx(7.5)
+    assert "print_date" not in spec.parameters(), "a core column, not a parameter"
+
+
+def test_test_before_print_is_rejected(tmp_path):
+    path = write_with_extra(tmp_path / "s.csv", ["print_date"], [["2026-07-20"]])
+    with pytest.raises(SpecimenError, match="before print_date"):
+        load_specimens(path)
+
+
+def test_date_order_is_reported_with_the_other_problems(tmp_path):
+    """Validation lists every problem at once; a swapped date is one of them."""
+    path = write_with_extra(tmp_path / "s.csv", ["print_date"], [["2026-07-20"]])
+    frame = pd.read_csv(path, dtype=str)
+    frame.loc[0, "side_length_mm"] = "twenty"
+    frame.to_csv(path, index=False)
+    with pytest.raises(SpecimenError) as caught:
+        load_specimens(path)
+    assert "before print_date" in str(caught.value)
+    assert "must be numeric" in str(caught.value)
+
+
+def test_a_utc_stamp_compares_with_a_plain_date(tmp_path):
+    path = write_with_extra(tmp_path / "s.csv", ["print_date"], [["2026-07-16T12:00:00Z"]])
+    assert load_specimens(path)[0].print_to_test_days() == pytest.approx(0.5)
+
+
+def test_unparseable_dates_are_rejected(tmp_path):
+    row = dict(GOOD_ROW, test_date="last tuesday")
+    path = write_csv(tmp_path / "s.csv", [row])
+    with pytest.raises(SpecimenError, match="'test_date' is not a date"):
+        load_specimens(path)
+
+
+def test_date_valued_extra_columns_become_datetime_parameters(tmp_path):
+    path = write_with_extra(
+        tmp_path / "s.csv", ["filament_dried_at"], [["2026-07-01 09:00"], ["2026-07-03 14:30"]]
+    )
+    specs = load_specimens(path)
+    stamp = specs[1].datetime_params()["filament_dried_at"]
+    assert stamp == pd.Timestamp("2026-07-03 14:30")
+    assert "filament_dried_at" not in specs[1].categorical_params()
+
+
+@pytest.mark.parametrize(
+    "cells, is_date",
+    [
+        (["2026-07-17 19:22", "2026-07-18"], True),
+        (["A1", "B3"], False),          # bed positions stay labels
+        (["May", "June"], False),       # dateutil would read these as year 1
+        (["20260717", "20260718"], False),  # numbers stay numbers
+        (["2026-07-17", "batch 2"], False),  # one non-date makes it categorical
+    ],
+)
+def test_datetime_column_detection(cells, is_date):
+    assert (parse_datetimes(pd.Series(cells)) is not None) == is_date
+
+
+def test_parse_date_handles_blanks():
+    assert parse_date("") is None and parse_date(None) is None and parse_date(float("nan")) is None
+    assert parse_date("2026-07-17") == pd.Timestamp("2026-07-17")

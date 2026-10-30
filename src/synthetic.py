@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 BOILERPLATE = ["Results Table 1", "", "", "Results Table 2", "", "", ""]
 HEADER = "Time,Displacement,Force"
@@ -197,21 +198,40 @@ PLANTED_LEVELS: dict[str, tuple] = {
     "nozzle_temp_C": (200.0, 210.0, 220.0),
 }
 
+#: Print batches, each printed on its own day -- so batch and print date are
+#: confounded by construction, as they usually are in practice.
+PLANTED_BATCH_DAYS: dict[str, str] = {
+    "B1": "2026-07-01", "B2": "2026-07-03", "B3": "2026-07-06", "B4": "2026-07-08",
+}
+#: Effect sizes of the planted manufacturing factors (multipliers on modulus
+#: and strength). Module-level so a power study can vary them.
+PLANTED_BATCH_FACTOR = 0.88   # batch B3
+PLANTED_EDGE_FACTOR = 0.85    # bed columns C1 and C4
+
+#: Build-plate positions: 2 rows x 4 columns; columns 1 and 4 are the edges.
+PLANTED_BED_POSITIONS: tuple[str, ...] = tuple(f"R{r}C{c}" for r in (1, 2) for c in (1, 2, 3, 4))
+
 #: The ground truth `planted_design` builds in. Anything not listed here has
-#: no effect at all -- print speed and nozzle temperature are pure nulls.
+#: no effect at all -- print speed, nozzle temperature and the time between
+#: printing and testing are pure nulls.
 PLANTED_TRUTH = """\
 relative density  rho* = k_topology * wall / cell * (1 + 3% noise)
                   k = 1.25 gyroid, 1.6 honeycomb
-modulus           E = 2500 MPa * rho*^2 * f_topology * f_layer      (bending, n = 2)
-plateau stress    sigma = 18 MPa * rho*^1.5 * f_topology * f_layer (bending, n = 1.5)
+modulus           E = 2500 MPa * rho*^2 * f_topology * f_layer * f_batch * f_bed
+plateau stress    sigma = 18 MPa * rho*^1.5 * (same factors)    (bending: n = 2, 1.5)
 topology          f = 1.0 gyroid, 1.3 honeycomb; honeycomb also buckles (first
                   peak 1.25 x plateau), gyroid does not
 layer height      f = 1 - 1.2 * (layer_height_mm - 0.20): about +/-10 percent --
                   small next to the ~30x spread from density, so it is MASKED
                   pairwise and only shows once density is held fixed
+print batch       f = 0.88 for batch B3 (say, wet filament), 1.0 otherwise --
+                  also masked pairwise. Each batch is printed on one day, so
+                  print_date is CONFOUNDED with it: one effect, two names
+bed position      f = 0.85 at the edge columns (C1, C4), 1.0 in the middle
 densification     strain = 0.75 - rho*, clipped to 0.30-0.55
 print speed       no effect
 nozzle temp       no effect
+print-to-test     no effect (tested 2-14 days after printing)
 """
 
 
@@ -223,8 +243,6 @@ def planted_design(n: int = 64, seed: int = 7) -> pd.DataFrame:
     independently per test. Returns one row per test with the parameters and
     the *true* properties (before any measurement), per PLANTED_TRUTH.
     """
-    import pandas as pd
-
     rng = np.random.default_rng(seed)
     combos = [
         (c, w, t)
@@ -236,19 +254,34 @@ def planted_design(n: int = 64, seed: int = 7) -> pd.DataFrame:
         raise ValueError(f"at most {len(combos)} distinct patterns available")
     picks = rng.choice(len(combos), size=n, replace=False)
 
+    batches = list(PLANTED_BATCH_DAYS)
+    batch_of = rng.permutation(np.resize(batches, n))
+    # Spread the bed positions evenly within each batch, as a real build plate is.
+    bed_of = np.empty(n, dtype=object)
+    for batch in batches:
+        members = np.flatnonzero(batch_of == batch)
+        bed_of[members] = rng.permutation(np.resize(PLANTED_BED_POSITIONS, len(members)))
+
     rows = []
     for i, pick in enumerate(picks):
         cell, wall, topology = combos[pick]
         layer = float(rng.choice(PLANTED_LEVELS["layer_height_mm"]))
         speed = float(rng.choice(PLANTED_LEVELS["print_speed_mm_s"]))
         temp = float(rng.choice(PLANTED_LEVELS["nozzle_temp_C"]))
+        batch, bed = str(batch_of[i]), str(bed_of[i])
+        printed = pd.Timestamp(PLANTED_BATCH_DAYS[batch]) + pd.Timedelta(hours=float(rng.uniform(8, 18)))
+        tested = (printed.normalize() + pd.Timedelta(days=int(rng.integers(2, 15)))
+                  + pd.Timedelta(hours=float(rng.uniform(9, 17))))
 
         k = 1.25 if topology == "gyroid" else 1.6
         rho = float(np.clip(k * wall / cell * (1 + rng.normal(0, 0.03)), 0.05, 0.6))
         f_top = 1.0 if topology == "gyroid" else 1.3
         f_layer = 1.0 - 1.2 * (layer - 0.20)
-        modulus = 2500.0 * rho**2 * f_top * f_layer * float(rng.lognormal(0, 0.05))
-        plateau = 18.0 * rho**1.5 * f_top * f_layer * float(rng.lognormal(0, 0.05))
+        f_batch = PLANTED_BATCH_FACTOR if batch == "B3" else 1.0
+        f_bed = PLANTED_EDGE_FACTOR if bed.endswith(("C1", "C4")) else 1.0
+        f_all = f_top * f_layer * f_batch * f_bed
+        modulus = 2500.0 * rho**2 * f_all * float(rng.lognormal(0, 0.05))
+        plateau = 18.0 * rho**1.5 * f_all * float(rng.lognormal(0, 0.05))
 
         rows.append(
             {
@@ -260,6 +293,10 @@ def planted_design(n: int = 64, seed: int = 7) -> pd.DataFrame:
                 "layer_height_mm": layer,
                 "print_speed_mm_s": speed,
                 "nozzle_temp_C": temp,
+                "print_batch": batch,
+                "bed_position": bed,
+                "print_date": f"{printed:%Y-%m-%d %H:%M}",
+                "test_date": f"{tested:%Y-%m-%d %H:%M}",
                 "relative_density": round(rho, 4),
                 "material": "PLA",
                 # Solid PLA ~1.24 g/cm^3 over a 20 mm cube (8 cm^3).

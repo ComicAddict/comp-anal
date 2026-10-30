@@ -258,3 +258,42 @@ def test_unknown_metric_raises(tmp_path):
     metrics = pd.DataFrame({"test_id": ["a"], "pattern_name": ["p"], "x": [1.0]})
     with pytest.raises(KeyError, match="nope"):
         plot_metric_space(metrics, "x", "nope", tmp_path / "x.png", DEFAULT_CONFIG)
+
+
+# ------------------------------------------------------ densification check ----
+from src.envelope import densification_trace, plot_densification_check  # noqa: E402
+from src.synthetic import FoamCurveSpec, foam_stress  # noqa: E402
+
+
+def foam_curve(test_id: str, max_strain: float, spec: FoamCurveSpec | None = None) -> StressStrainCurve:
+    strain = np.linspace(0, max_strain, 3000)
+    stress = foam_stress(strain, spec or FoamCurveSpec(peak_stress_MPa=None))
+    return StressStrainCurve(test_id, strain, stress, stress * 256, strain * 16,
+                             np.linspace(0, 100, strain.size))
+
+
+def test_gauge_is_one_half_in_the_linear_elastic_region():
+    """sigma = E*eps gives W = E*eps^2/2, so r = E * W / sigma^2 = 1/2 exactly."""
+    trace = densification_trace(foam_curve("t", 0.6))
+    # Knee at 2.15 / 60 = 0.036; keep clear of it by the derivative window
+    # (0.01 strain), which otherwise blends the knee into the estimate.
+    elastic = (trace.strain > 0.008) & (trace.strain < 0.024)
+    assert np.nanmean(trace.ratio[elastic]) == pytest.approx(0.5, abs=0.01)
+
+
+def test_gauge_crosses_one_after_densification_and_not_before():
+    full = densification_trace(foam_curve("full", 0.6))     # densifies at 0.42
+    cut = densification_trace(foam_curve("cut", 0.35))      # stops in the plateau
+    assert full.reached
+    crossing = full.strain[np.flatnonzero(full.ratio >= 1.0)[0]]
+    assert 0.42 < crossing < 0.55
+    assert not cut.reached and cut.final_ratio < 1.0
+
+
+def test_densification_check_figure_states_the_verdict(monkeypatch, tmp_path):
+    captured = capture_figure(monkeypatch)
+    plot_densification_check([foam_curve("a", 0.35), foam_curve("b", 0.6)], tmp_path / "d.png",
+                             load_limited=True)
+    title = captured["fig"].axes[0].get_title(loc="left")
+    assert "1 of 2 tests reached densification" in title
+    assert "the others stop at r =" in title and "load limit" in title

@@ -22,6 +22,7 @@ from .config import DEFAULT_CONFIG, AnalysisConfig
 from .envelope import (
     build_curve_matrix,
     display_name,
+    plot_densification_check,
     plot_metric_space,
     plot_stress_strain_envelope,
     resolve_column,
@@ -29,7 +30,7 @@ from .envelope import (
 from .io import Diagnostic, load_test
 from .mechanics import StressStrainCurve, to_stress_strain
 from .metrics import compute_metrics
-from .specimens import Specimen, load_specimens
+from .specimens import Specimen, load_specimens, parse_datetimes
 
 #: Axis labels for the generated figures.
 LABELS: dict[str, str] = {
@@ -186,6 +187,7 @@ def analyse_specimen(
             "replicate": spec.replicate,
             "material": spec.material,
             "test_date": spec.test_date,
+            "print_date": spec.print_date,
             "side_length_mm": spec.side_length_mm,
             "cross_section_area_mm2": spec.cross_section_area_mm2,
             "initial_height_mm": spec.initial_height_mm,
@@ -207,12 +209,17 @@ def analyse_specimen(
     )
     row.update(censor_flags(metrics, loaded.force_limited))
 
-    # Every design and manufacturing parameter, numeric or categorical, gets a
-    # param_<key> column -- that is what the correlation analysis reads.
+    # Every design and manufacturing parameter -- numeric, categorical or a
+    # date -- gets a param_<key> column; that is what the correlation reads.
     for key, value in spec.numeric_params().items():
         row[f"param_{key}"] = value
     for key, value in spec.categorical_params().items():
         row[f"param_{key}"] = value
+    for key, value in spec.datetime_params().items():
+        row[f"param_{key}"] = value.isoformat(sep=" ")
+    age = spec.print_to_test_days()
+    if age is not None and "print_to_test_days" not in spec.parameters():
+        row["param_print_to_test_days"] = round(age, 4)
     return row, diagnostics, final_curve
 
 
@@ -431,6 +438,18 @@ def make_figures(
             f"parameters: {available_parameters(metrics) or 'none'}"
         )
 
+    # Dates colour as elapsed time, not as dozens of distinct labels.
+    color_by_values, color_label = color_col, display_name(color_col) if color_col else ""
+    if color_col:
+        stamps = parse_datetimes(metrics[color_col])
+        if stamps is not None:
+            origin = stamps.min().normalize()
+            metrics = metrics.assign(
+                _color_days=(stamps - origin).dt.total_seconds() / 86400.0
+            )
+            color_by_values = "_color_days"
+            color_label = f"{display_name(color_col)} (days since {origin:%Y-%m-%d})"
+
     # (a) Stress-strain overlay + shaded envelope.
     rows = [row for row in metrics.itertuples(index=False) if str(row.test_id) in curves]
     items = [(str(r.test_id), str(r.pattern_name), curves[str(r.test_id)]) for r in rows]
@@ -438,16 +457,26 @@ def make_figures(
         matrix = build_curve_matrix(items, cfg.envelope_n_points, strain_max)
         values = None
         if color_col:
-            lookup = metrics.set_index(metrics["test_id"].astype(str))[color_col]
+            lookup = metrics.set_index(metrics["test_id"].astype(str))[color_by_values]
             values = [lookup.get(t) for t in matrix.test_ids]
         written.append(
             plot_stress_strain_envelope(
                 matrix, paths.figures_dir / "stress_strain_envelope.png", cfg,
-                color_values=values,
-                color_label=display_name(color_col) if color_col else "",
+                color_values=values, color_label=color_label,
             )
         )
         matrix.frame().to_csv(paths.results_dir / "resampled_curves.csv")
+
+        load_limited = (
+            "ended_at_force_limit" in metrics.columns
+            and metrics["ended_at_force_limit"].astype(str).str.lower().eq("true").any()
+        )
+        out = plot_densification_check(
+            [c for _, _, c in items], paths.figures_dir / "densification_check.png", cfg,
+            load_limited=bool(load_limited),
+        )
+        if out is not None:
+            written.append(out)
 
     # (b) Metric-space scatter with achievable-property hull.
     for x, y in pairs:
@@ -457,7 +486,7 @@ def make_figures(
             continue
         out = plot_metric_space(
             metrics, x, y, paths.figures_dir / f"metric_space_{y}_vs_{x}.png",
-            cfg, labels=LABELS, color_by=color_col,
+            cfg, labels=LABELS, color_by=color_by_values, color_label=color_label,
         )
         if out is not None:
             written.append(out)

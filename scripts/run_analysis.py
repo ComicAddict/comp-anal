@@ -178,18 +178,10 @@ def summarise(result, paths: PipelinePaths) -> None:
             )
 
     if not result.skipped and len(metrics):
-        columns = [
-            c
-            for c in (
-                "test_id", "pattern_name", "modulus_MPa", "plateau_stress_MPa",
-                "densification_strain", "energy_absorption_MJ_m3",
-            )
-            if c in metrics.columns
-        ]
         if len(metrics) <= 20:
-            print("\nSummary:")
-            with pd.option_context("display.width", 160, "display.max_columns", None):
-                print(metrics[columns].to_string(index=False, float_format=lambda v: f"{v:.4g}"))
+            print("\nSummary  (≥ = lower bound: the test stopped before densifying)")
+            with pd.option_context("display.width", 200, "display.max_columns", None):
+                print(summary_table(metrics).to_string(index=False))
         else:
             print(f"\n{len(metrics)} tests -- see {paths.metrics_csv} for the full table.")
 
@@ -199,12 +191,65 @@ def summarise(result, paths: PipelinePaths) -> None:
         print("\n" + correlation_summary(result.correlation))
         print(f"\n  tables  -> {paths.correlation_dir}/")
         print(f"  figures -> {paths.correlation_figures_dir}/")
-    elif not result.skipped and "param_" not in " ".join(metrics.columns):
-        print(
-            "\nNo design/manufacturing parameters recorded, so no correlation "
-            "analysis.\n  Add them as extra columns in specimens.csv (one per "
-            "parameter) or in pattern_params."
-        )
+    elif not result.skipped:
+        explain_no_correlation(metrics, paths)
+
+
+def summary_table(metrics: pd.DataFrame) -> pd.DataFrame:
+    """The headline numbers, truncation-safe ones first, bounds marked."""
+    def fmt(value, bound=False):
+        if pd.isna(value):
+            return "–"
+        return ("≥" if bound else "") + f"{value:.4g}"
+
+    def flag(column):
+        return metrics[column].astype(str).str.lower().eq("true") if column in metrics else False
+
+    table = pd.DataFrame({"test_id": metrics["test_id"], "pattern": metrics["pattern_name"]})
+    for column, label in (
+        ("modulus_MPa", "E (MPa)"),
+        ("plateau_stress_MPa", "plateau σ"),
+        ("stress_at_10pct_MPa", "σ@10%"),
+        ("stress_at_20pct_MPa", "σ@20%"),
+        ("energy_to_20pct_MJ_m3", "W@20% (MJ/m³)"),
+    ):
+        if column in metrics:
+            table[label] = [fmt(v) for v in metrics[column]]
+    if "densification_strain" in metrics:
+        bounds = flag("densification_censored")
+        table["ε_D"] = [fmt(v, b) for v, b in zip(metrics["densification_strain"], bounds)]
+    if "energy_absorption_MJ_m3" in metrics:
+        bounds = flag("energy_censored")
+        table["W@ε_D"] = [fmt(v, b) for v, b in zip(metrics["energy_absorption_MJ_m3"], bounds)]
+    return table
+
+
+def explain_no_correlation(metrics: pd.DataFrame, paths: PipelinePaths) -> None:
+    """Say exactly why there is nothing to correlate, and what would fix it."""
+    from src.correlation import discover_parameters
+    from src.specimens import COLUMNS
+
+    print("\nNo parameter varies across the tests yet, so no correlation analysis.")
+    try:
+        header = pd.read_csv(paths.specimens_csv, dtype=str, nrows=0).columns
+        frame = pd.read_csv(paths.specimens_csv, dtype=str)
+    except (OSError, ValueError):
+        return
+    # Optional core columns (print_date) and user-added parameter columns are
+    # exactly the ones outside the required schema.
+    blank = [
+        c for c in header
+        if c not in COLUMNS and frame[c].fillna("").str.strip().eq("").all()
+    ]
+    if blank:
+        print(f"  Columns with no values yet: {', '.join(blank)}")
+    constant = [p.name for p in discover_parameters(metrics) if p.reason == "the same value for every test"]
+    if constant:
+        print(f"  Same for every test: {', '.join(constant)}")
+    print(
+        "  Fill those in (or add a column per design/manufacturing parameter) and re-run;\n"
+        "  see data/specimens.example.csv for the layout."
+    )
 
 
 def run_once(paths: PipelinePaths, args: argparse.Namespace, cfg: AnalysisConfig) -> int:

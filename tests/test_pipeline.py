@@ -588,3 +588,45 @@ def test_register_append_keeps_user_added_columns_aligned(tmp_path):
     assert list(frame.columns) == list(COLUMNS) + ["layer_height_mm"]
     assert frame.loc[1, "material"] == "PLA", "values shifted under the header"
     assert pd.isna(frame.loc[1, "layer_height_mm"])
+
+
+def test_register_adds_print_date_column_to_an_older_file(tmp_path):
+    """A file from before print_date existed gains the column, values intact."""
+    import csv
+
+    import register_test as cli
+    from src.specimens import COLUMNS
+    from src.synthetic import SyntheticTest
+
+    raw_dir = tmp_path / "data" / "raw"
+    for name in ("a.csv", "b.csv"):
+        SyntheticTest(name=name, seed=1).write(raw_dir / name)
+    specimens = tmp_path / "data" / "specimens.csv"
+    with specimens.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(COLUMNS))
+        writer.writeheader()
+        row = {c: "" for c in COLUMNS}
+        row.update(test_id="a", raw_file="a.csv", pattern_name="p", replicate="1",
+                   side_length_mm="16", initial_height_mm="16", material="PLA",
+                   test_date="2026-07-17")
+        writer.writerow(row)
+
+    assert cli.main(["--root", str(tmp_path), "--raw-file", "b.csv", "--pattern-name", "p",
+                     "--replicate", "2", "--side-length-mm", "16", "--material", "PLA",
+                     "--test-date", "2026-07-18 10:00", "--print-date", "2026-07-11 09:00"]) == 0
+    frame = pd.read_csv(specimens, dtype=str)
+    assert "print_date" in frame.columns
+    assert frame.loc[0, "test_date"] == "2026-07-17"          # old row untouched
+    assert frame.loc[1, "print_date"] == "2026-07-11 09:00"
+
+
+def test_register_rejects_a_bad_date(tmp_path, capsys):
+    import register_test as cli
+    from src.synthetic import SyntheticTest
+
+    SyntheticTest(name="a.csv", seed=1).write(tmp_path / "data" / "raw" / "a.csv")
+    status = cli.main(["--root", str(tmp_path), "--raw-file", "a.csv", "--pattern-name", "p",
+                       "--replicate", "1", "--side-length-mm", "16", "--material", "PLA",
+                       "--print-date", "yesterday"])
+    assert status == 1
+    assert "not a date" in capsys.readouterr().err

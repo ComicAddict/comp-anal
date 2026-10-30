@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 
 from src.pipeline import PipelinePaths
-from src.specimens import COLUMNS, SpecimenError, unregistered_files
+from src.specimens import COLUMNS, OPTIONAL_COLUMNS, SpecimenError, parse_date, unregistered_files
 
 DATE_IN_NAME = re.compile(r"_(\d{4})(\d{2})(\d{2})_")
 
@@ -87,7 +87,8 @@ def collect_interactively(raw_file: str, args: argparse.Namespace) -> dict[str, 
     rel_density = args.relative_density or prompt("relative_density (blank = unknown)", "")
     mass = args.mass_g or prompt("mass_g (blank = SEA reported by volume)", "")
     material = args.material or prompt("material", required=True)
-    test_date = args.test_date or prompt("test_date", date_from_filename(raw_file) or "")
+    print_date = args.print_date or prompt("print_date (when printed, e.g. 2026-07-10 14:30)", "")
+    test_date = args.test_date or prompt("test_date (when tested)", date_from_filename(raw_file) or "")
     notes = args.notes if args.notes is not None else prompt("notes", "")
 
     return {
@@ -103,6 +104,7 @@ def collect_interactively(raw_file: str, args: argparse.Namespace) -> dict[str, 
         "mass_g": mass,
         "material": material,
         "test_date": test_date,
+        "print_date": print_date,
         "notes": notes,
     }
 
@@ -138,6 +140,7 @@ def collect_from_args(raw_file: str, args: argparse.Namespace) -> dict[str, str]
         "mass_g": args.mass_g or "",
         "material": args.material,
         "test_date": args.test_date or date_from_filename(raw_file) or "",
+        "print_date": args.print_date or "",
         "notes": args.notes or "",
     }
 
@@ -158,6 +161,16 @@ def validate_row(row: dict[str, str]) -> None:
         except ValueError as exc:
             raise SpecimenError(f"{field} must be numeric, got {row[field]!r}") from exc
 
+    for field in ("test_date", "print_date"):
+        value = row.get(field, "").strip()
+        if value and parse_date(value) is None:
+            raise SpecimenError(f"{field} is not a date: {value!r} (use e.g. 2026-07-17 19:22)")
+    printed, tested = parse_date(row.get("print_date")), parse_date(row.get("test_date"))
+    if printed is not None and tested is not None and tested < printed:
+        raise SpecimenError(
+            f"test_date ({row['test_date']}) is before print_date ({row['print_date']})"
+        )
+
     for field in ("cross_section_area_mm2", "relative_density", "mass_g"):
         if row[field].strip():
             try:
@@ -173,23 +186,33 @@ def append_row(specimens_csv: Path, row: dict[str, str]) -> None:
 
     An existing file's own header is used as-is, so parameter columns the user
     added by hand keep their place (left blank in the new row) instead of the
-    new row being written short and shifting every value after it.
+    new row being written short and shifting every value after it. A newer
+    optional column (print_date) that the file predates is added to it, rather
+    than its value being silently dropped.
     """
     specimens_csv.parent.mkdir(parents=True, exist_ok=True)
     is_new = not specimens_csv.exists() or specimens_csv.stat().st_size == 0
 
-    fieldnames = list(COLUMNS)
+    fieldnames = list(COLUMNS) + list(OPTIONAL_COLUMNS)
     if not is_new:
         with specimens_csv.open(newline="", encoding="utf-8") as handle:
-            header = next(csv.reader(handle), [])
-        if header:
-            fieldnames = header + [c for c in COLUMNS if c not in header]
-            missing = [c for c in COLUMNS if c not in header]
-            if missing:
-                raise SpecimenError(
-                    f"{specimens_csv} is missing column(s) {missing}; add them "
-                    f"to its header before registering more tests"
-                )
+            reader = csv.DictReader(handle)
+            header = list(reader.fieldnames or [])
+            existing = list(reader)
+        missing = [c for c in COLUMNS if c not in header]
+        if missing:
+            raise SpecimenError(
+                f"{specimens_csv} is missing column(s) {missing}; add them "
+                f"to its header before registering more tests"
+            )
+        fieldnames = header
+        added = [c for c in OPTIONAL_COLUMNS if c not in header and row.get(c, "").strip()]
+        if added:
+            fieldnames = header + added
+            with specimens_csv.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows({c: r.get(c, "") for c in fieldnames} for r in existing)
 
     with specimens_csv.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -260,6 +283,7 @@ def write_template(paths, pending: list[str], skip: set[str]) -> int:
                 "mass_g": "",
                 "material": "",
                 "test_date": date_from_filename(raw_file) or "",
+                "print_date": "",
                 "notes": (
                     "DUPLICATE of another export in this list -- delete this row "
                     "unless it really is a separate specimen"
@@ -271,7 +295,7 @@ def write_template(paths, pending: list[str], skip: set[str]) -> int:
 
     paths.specimens_csv.parent.mkdir(parents=True, exist_ok=True)
     with paths.specimens_csv.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(COLUMNS))
+        writer = csv.DictWriter(handle, fieldnames=list(COLUMNS) + list(OPTIONAL_COLUMNS))
         writer.writeheader()
         writer.writerows(rows)
 
@@ -286,6 +310,7 @@ def write_template(paths, pending: list[str], skip: set[str]) -> int:
     print("  mass_g            enables SEA per unit mass instead of per volume")
     print("  relative_density  specimen / bulk material density")
     print("  pattern_params    JSON, e.g. {\"cell_mm\": 5.0, \"wall_mm\": 0.8}")
+    print("  print_date        when printed; with test_date, gives the print-to-test age")
     print("\ncross_section_area_mm2 can stay blank -- it is derived as side_length^2.")
     print(
         "\nTo correlate design and manufacturing parameters with the results, add one"
@@ -332,7 +357,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--relative-density", help="specimen / bulk material density")
     parser.add_argument("--mass-g", help="specimen mass; enables SEA per unit mass")
     parser.add_argument("--material", help="build material")
-    parser.add_argument("--test-date", help="YYYY-MM-DD (default: parsed from filename)")
+    parser.add_argument("--test-date", help="YYYY-MM-DD[ HH:MM] (default: parsed from filename)")
+    parser.add_argument("--print-date", help="when the specimen was printed, YYYY-MM-DD[ HH:MM]")
     parser.add_argument("--notes", help="free text")
     parser.add_argument(
         "--dry-run", action="store_true", help="show the row without writing it"

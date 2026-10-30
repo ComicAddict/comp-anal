@@ -58,6 +58,7 @@ from matplotlib.colors import Normalize, to_rgb
 from scipy import stats
 
 from .config import DEFAULT_CONFIG, AnalysisConfig
+from .specimens import parse_datetimes
 from .envelope import (
     GRID,
     INK,
@@ -75,6 +76,11 @@ from .envelope import (
 #: Core specimens.csv columns that are parameters, alongside the param_* ones.
 CORE_NUMERIC: tuple[str, ...] = ("relative_density", "side_length_mm", "initial_height_mm")
 CORE_CATEGORICAL: tuple[str, ...] = ("material", "pattern_name")
+#: Core date columns. Analysed as elapsed time, so a trend across the print
+#: campaign (printer or filament drift) or the test campaign shows up.
+CORE_DATES: tuple[str, ...] = ("print_date", "test_date")
+#: Derived from the two dates by the pipeline: days from printing to testing.
+AGE_COLUMN = "param_print_to_test_days"
 
 #: Property -> column flagging rows where that property is only a lower bound.
 CENSOR_FLAGS: dict[str, str] = {
@@ -211,6 +217,50 @@ def _residualise(values: np.ndarray, design: np.ndarray) -> np.ndarray:
     return values - design @ coef
 
 
+def _log_columns(values: np.ndarray) -> list[np.ndarray]:
+    """Standardised logs of the strictly positive columns."""
+    out = []
+    for column in values.T:
+        if np.all(column > 0):
+            logged = np.log(column)
+            if np.ptp(logged) > 0:
+                out.append((logged - logged.mean()) / logged.std())
+    return out
+
+
+def determination(target: np.ndarray, controls: np.ndarray) -> float:
+    """How far `target` is determined by `controls` (an R^2, 0 to 1).
+
+    Judged on ranks *and* logs. Ranks catch any monotonic link; logs catch
+    the multiplicative ones geometry is full of -- relative density is
+    k * wall / cell, which no linear combination of ranks reproduces, but
+    which is exactly linear in logs. Without them a topology that is fully
+    determined by density, wall and cell scored R^2 = 0.77 and passed as
+    separable. Logs are added only while the fit keeps at least half its
+    observations as spare degrees of freedom, so a small sample cannot fake
+    a perfect fit.
+    """
+    n = len(target)
+    if controls.size == 0 or n < 4:
+        return 0.0
+    columns = [np.ones(n)] + [stats.rankdata(c) for c in controls.T]
+    extra = _log_columns(controls)
+    if len(columns) + len(extra) <= n // 2:
+        columns += extra
+    design = np.column_stack(columns)
+    targets = [stats.rankdata(target)]
+    if np.all(target > 0) and np.ptp(target) > 0:
+        targets.append(np.log(target))
+    best = 0.0
+    for t in targets:
+        spread = float(((t - t.mean()) ** 2).sum())
+        if spread <= 0:
+            continue
+        resid = _residualise(t, design)
+        best = max(best, 1.0 - float((resid**2).sum()) / spread)
+    return float(min(best, 1.0))
+
+
 def partial_spearman(
     x: np.ndarray, y: np.ndarray, controls: np.ndarray
 ) -> tuple[float, float, int, float]:
@@ -232,7 +282,7 @@ def partial_spearman(
     columns = [np.ones(n)] + [stats.rankdata(controls[:, j]) for j in range(k)]
     design = np.column_stack(columns)
     ex, ey = _residualise(rx, design), _residualise(ry, design)
-    r2_x = float(1.0 - ex.var() / rx.var()) if rx.var() > 0 else math.nan
+    r2_x = determination(x, controls) if rx.var() > 0 else math.nan
     if ex.var() <= 1e-9 * rx.var() or ey.var() <= 1e-9 * ry.var():
         return math.nan, math.nan, df, r2_x
 
@@ -267,23 +317,30 @@ def dummy_controls(categorical: pd.DataFrame, infos: Sequence["ParameterInfo"]) 
 def control_matrix(
     numeric: pd.DataFrame,
     dummies: pd.DataFrame,
-    exclude: str,
+    exclude: str | Sequence[str],
     rows: pd.Series,
+    exclude_factors: Sequence[str] = (),
 ) -> tuple[np.ndarray, list[str]]:
     """Every other parameter usable as a control on `rows`.
 
     A control must be recorded on all of those rows and vary across them; a
     parameter only defined for some patterns is used only where complete.
+    `exclude` names numeric columns and `exclude_factors` categorical factors
+    to leave out (the parameter under test, and its near-duplicates).
     """
+    excluded = {exclude} if isinstance(exclude, str) else set(exclude)
+    skip_prefixes = tuple(f"{factor}=" for factor in exclude_factors)
     blocks, names = [], []
     for column in numeric.columns:
-        if column == exclude:
+        if column in excluded:
             continue
         values = numeric.loc[rows, column]
         if values.notna().all() and values.nunique() > 1:
             blocks.append(values.to_numpy(dtype=float))
             names.append(display_name(column))
     for column in dummies.columns:
+        if skip_prefixes and column.startswith(skip_prefixes):
+            continue
         values = dummies.loc[rows, column]
         if values.notna().all() and values.nunique() > 1:
             blocks.append(values.to_numpy(dtype=float))
@@ -292,19 +349,27 @@ def control_matrix(
     return (np.column_stack(blocks) if blocks else np.empty((n, 0))), names
 
 
-def rank_vif(numeric: pd.DataFrame, dummies: pd.DataFrame | None = None) -> dict[str, float]:
+def rank_vif(
+    numeric: pd.DataFrame,
+    dummies: pd.DataFrame | None = None,
+    exclusions: dict[str, tuple[list[str], list[str]]] | None = None,
+) -> dict[str, float]:
     """Variance inflation factor of each numeric parameter, on ranks.
 
     VIF_j = 1 / (1 - R^2_j), with R^2_j from regressing parameter j on every
     other parameter (categorical ones as indicators) over the tests where j is
     recorded. 1 means independent of the rest; above ~10, the parameter is so
     predictable from the others that its separate effect is not identifiable.
+    `exclusions` leaves out a parameter's confounded twin, which is reported
+    as such separately -- VIF then measures entanglement beyond it.
     """
     dummies = dummies if dummies is not None else pd.DataFrame(index=numeric.index)
+    exclusions = exclusions or {}
     out: dict[str, float] = {}
     for column in numeric.columns:
         rows = numeric[column].notna()
-        z, _ = control_matrix(numeric, dummies, column, rows)
+        numeric_out, factors_out = exclusions.get(column, ([column], []))
+        z, _ = control_matrix(numeric, dummies, numeric_out, rows, factors_out)
         n, k = int(rows.sum()), z.shape[1]
         if k == 0:
             out[column] = 1.0
@@ -312,13 +377,84 @@ def rank_vif(numeric: pd.DataFrame, dummies: pd.DataFrame | None = None) -> dict
         if n < k + 3:
             out[column] = math.nan
             continue
-        target = stats.rankdata(numeric.loc[rows, column].to_numpy(dtype=float))
-        design = np.column_stack([np.ones(n)] + [stats.rankdata(z[:, j]) for j in range(k)])
-        resid = _residualise(target, design)
-        total = float(((target - target.mean()) ** 2).sum())
-        r2 = 1.0 - float((resid**2).sum()) / total if total > 0 else 1.0
+        r2 = determination(numeric.loc[rows, column].to_numpy(dtype=float), z)
         out[column] = _vif_from_r2(r2)
     return out
+
+
+def correlation_ratio(values: np.ndarray, groups: np.ndarray) -> float:
+    """eta: how well group membership predicts the (ranked) values, 0 to 1.
+
+    The square root of the between-group share of rank variance, so it sits
+    on the same 0-1 scale as |rho| when judging how entangled two parameters
+    are.
+    """
+    ranks = stats.rankdata(values)
+    total = float(((ranks - ranks.mean()) ** 2).sum())
+    if total <= 0:
+        return math.nan
+    between = sum(
+        (groups == g).sum() * (ranks[groups == g].mean() - ranks.mean()) ** 2
+        for g in np.unique(groups)
+    )
+    return float(math.sqrt(between / total))
+
+
+def cramers_v(a: np.ndarray, b: np.ndarray) -> float:
+    """Association between two categorical factors, 0 (none) to 1 (identical)."""
+    table = pd.crosstab(a, b).to_numpy(dtype=float)
+    if min(table.shape) < 2:
+        return math.nan
+    chi2 = stats.chi2_contingency(table, correction=False)[0]
+    return float(math.sqrt(chi2 / (table.sum() * (min(table.shape) - 1))))
+
+
+def quade_partial(
+    y: np.ndarray, groups: np.ndarray, controls: np.ndarray
+) -> tuple[float, float, float, float]:
+    """Does a categorical factor matter once the controls are held fixed?
+
+    Quade's rank analysis of covariance: rank y, regress out the ranked
+    controls, then a one-way ANOVA of the residuals across the factor's
+    levels. Returns (F, p, partial eta^2, r2_groups), where r2_groups is how
+    well the controls predict level membership -- high means the factor's
+    effect cannot be separated from theirs.
+    """
+    n = len(y)
+    k = 0 if controls.size == 0 else controls.shape[1]
+    levels = np.unique(groups)
+    df1, df2 = len(levels) - 1, n - len(levels) - k
+    if df1 < 1 or df2 < 3:
+        return math.nan, math.nan, math.nan, math.nan
+
+    design = np.column_stack([np.ones(n)] + [stats.rankdata(controls[:, j]) for j in range(k)])
+    resid = _residualise(stats.rankdata(y), design)
+    grand = resid.mean()
+    ssb = float(sum((groups == g).sum() * (resid[groups == g].mean() - grand) ** 2 for g in levels))
+    ssw = float(sum(((resid[groups == g] - resid[groups == g].mean()) ** 2).sum() for g in levels))
+    if ssw <= 0:
+        return math.nan, math.nan, math.nan, math.nan
+
+    r2_groups = 0.0
+    for g in levels[1:]:
+        member = (groups == g).astype(float)
+        if member.std() > 0:
+            r2_groups = max(r2_groups, _linear_r2(member, controls))
+
+    f_stat = (ssb / df1) / (ssw / df2)
+    return f_stat, float(stats.f.sf(f_stat, df1, df2)), ssb / (ssb + ssw), r2_groups
+
+
+def _linear_r2(target: np.ndarray, controls: np.ndarray) -> float:
+    """R^2 of a 0/1 indicator on ranked and logged controls (see determination)."""
+    n = len(target)
+    columns = [np.ones(n)] + [stats.rankdata(c) for c in controls.T]
+    extra = _log_columns(controls)
+    if len(columns) + len(extra) <= n // 2:
+        columns += extra
+    resid = _residualise(target, np.column_stack(columns))
+    spread = float(((target - target.mean()) ** 2).sum())
+    return 1.0 - float((resid**2).sum()) / spread if spread > 0 else 0.0
 
 
 def kruskal_effect(
@@ -423,7 +559,7 @@ def interpret_exponent(kind: str, lo: float, hi: float) -> str:
 def _strength(effect: float, kind: str) -> str:
     if not np.isfinite(effect):
         return ""
-    bands = (0.1, 0.3, 0.5) if kind == "numeric" else (0.01, 0.08, 0.26)
+    bands = (0.01, 0.08, 0.26) if kind == "categorical" else (0.1, 0.3, 0.5)
     labels = ("negligible", "weak", "moderate", "strong")
     a = abs(effect)
     for band, label in zip(bands, labels):
@@ -440,24 +576,41 @@ class ParameterInfo:
     """One candidate parameter and whether it could be analysed."""
 
     column: str
-    kind: str                       # "numeric" | "categorical"
+    kind: str                       # "numeric" | "datetime" | "categorical"
     n: int = 0
     n_distinct: int = 0
     included: bool = False
     reason: str = ""
     levels: list[str] = field(default_factory=list)
     vif: float = math.nan
+    #: Datetime parameters are analysed as days since this moment.
+    origin: pd.Timestamp | None = None
+    #: Parameters so strongly associated with this one that the data cannot
+    #: tell them apart. Never held fixed when testing it (that would erase
+    #: both); reported as confounded instead.
+    duplicates: list[str] = field(default_factory=list)
 
     @property
     def name(self) -> str:
         return display_name(self.column)
+
+    @property
+    def is_ordered(self) -> bool:
+        """Numeric or datetime: has an order, so rank correlation applies."""
+        return self.kind in ("numeric", "datetime")
+
+    @property
+    def axis_label(self) -> str:
+        if self.kind == "datetime" and self.origin is not None:
+            return f"{self.name} (days since {self.origin:%Y-%m-%d})"
+        return self.name
 
 
 def _parameter_order(metrics: pd.DataFrame) -> list[str]:
     params = [c for c in metrics.columns if c.startswith("param_")]
     ordered = [c for c in ("relative_density",) if c in metrics.columns]
     ordered += params
-    ordered += [c for c in CORE_NUMERIC[1:] + CORE_CATEGORICAL if c in metrics.columns]
+    ordered += [c for c in CORE_NUMERIC[1:] + CORE_DATES + CORE_CATEGORICAL if c in metrics.columns]
     return ordered
 
 
@@ -484,19 +637,29 @@ def discover_parameters(
         present = raw.notna() & (raw.astype(str).str.strip() != "")
         numeric = pd.to_numeric(raw.where(present), errors="coerce")
         is_numeric = bool(present.any()) and bool(numeric[present].notna().all())
+        dates = None
         if column in CORE_CATEGORICAL:
             is_numeric = False
+        elif not is_numeric:
+            dates = parse_datetimes(raw)
 
-        info = ParameterInfo(column=column, kind="numeric" if is_numeric else "categorical")
+        kind = "numeric" if is_numeric else "datetime" if dates is not None else "categorical"
+        info = ParameterInfo(column=column, kind=kind)
         info.n = int(present.sum())
-        values = numeric[present] if is_numeric else raw[present].astype(str).str.strip()
+        if kind == "numeric":
+            values = numeric[present]
+        elif kind == "datetime":
+            values = dates[present]
+            info.origin = values.min().normalize()
+        else:
+            values = raw[present].astype(str).str.strip()
         info.n_distinct = int(values.nunique())
 
         if info.n == 0:
             info.reason = "no values recorded"
         elif info.n_distinct < 2:
             info.reason = "the same value for every test"
-        elif is_numeric:
+        elif info.is_ordered:
             if info.n < cfg.correlation_min_n:
                 info.reason = f"only {info.n} tests have a value (need {cfg.correlation_min_n})"
             else:
@@ -516,6 +679,18 @@ def discover_parameters(
                 info.included = True
                 info.levels = [str(level) for level in levels]
         infos.append(info)
+
+    # test_date = print_date + print_to_test_days exactly, so with all three
+    # varying one is redundant. Keep print date (manufacturing drift) and age
+    # (ageing/moisture); test date is available on request.
+    by_column = {i.column: i for i in infos}
+    trio = [by_column.get(c) for c in ("print_date", "test_date", AGE_COLUMN)]
+    if not include and all(i is not None and i.included for i in trio):
+        trio[1].included = False
+        trio[1].reason = (
+            "redundant -- it equals print_date + print_to_test_days; pass "
+            "--parameters to analyse it in place of one of those"
+        )
     return infos
 
 
@@ -614,6 +789,8 @@ class CorrelationResult:
                     "analysed": p.included,
                     "levels": ", ".join(p.levels),
                     "vif": p.vif,
+                    "confounded_with": ", ".join(p.duplicates),
+                    "days_since": "" if p.origin is None else f"{p.origin:%Y-%m-%d}",
                     "reason_not_analysed": p.reason,
                 }
                 for p in self.parameters
@@ -631,13 +808,19 @@ def analyse(
     metrics = metrics.reset_index(drop=True)
     infos = discover_parameters(metrics, cfg, parameters)
     included = [p for p in infos if p.included]
-    numeric_infos = [p for p in included if p.kind == "numeric"]
+    ordered_infos = [p for p in included if p.is_ordered]
     categorical_infos = [p for p in included if p.kind == "categorical"]
 
-    numeric = pd.DataFrame(
-        {p.column: pd.to_numeric(metrics[p.column], errors="coerce") for p in numeric_infos},
-        index=metrics.index,
-    )
+    # Numeric and datetime parameters share one numeric frame; dates enter as
+    # days since their earliest value (rank statistics ignore the offset).
+    columns: dict[str, pd.Series] = {}
+    for info in ordered_infos:
+        if info.kind == "datetime":
+            stamps = parse_datetimes(metrics[info.column])
+            columns[info.column] = (stamps - info.origin).dt.total_seconds() / 86400.0
+        else:
+            columns[info.column] = pd.to_numeric(metrics[info.column], errors="coerce")
+    numeric = pd.DataFrame(columns, index=metrics.index)
     categorical = pd.DataFrame(
         {
             p.column: metrics[p.column].where(
@@ -649,8 +832,18 @@ def analyse(
     )
 
     dummies = dummy_controls(categorical, categorical_infos)
-    for column, vif in rank_vif(numeric, dummies).items():
-        next(p for p in numeric_infos if p.column == column).vif = vif
+    association = _association_matrix(included, numeric, categorical)
+    for info in included:
+        info.duplicates = [
+            other.name for other in included
+            if other is not info
+            and np.isfinite(association.loc[info.name, other.name])
+            and abs(association.loc[info.name, other.name]) >= cfg.correlation_collinear_rho
+        ]
+    by_name = {p.name: p for p in included}
+    exclusions = {p.column: _exclusions(p, by_name) for p in ordered_infos}
+    for column, vif in rank_vif(numeric, dummies, exclusions).items():
+        by_name[display_name(column)].vif = vif
 
     requested = list(properties) if properties else list(cfg.correlation_properties)
     props = property_data(metrics, requested, cfg)
@@ -659,10 +852,13 @@ def analyse(
     rows: list[dict[str, Any]] = []
     for prop in prop_columns:
         y_all = props.values[prop]
-        for info in numeric_infos:
-            rows.append(_numeric_row(info, prop, numeric, dummies, y_all, props, cfg))
+        for info in ordered_infos:
+            rows.append(_numeric_row(info, prop, numeric, dummies, y_all, props, cfg, by_name))
         for info in categorical_infos:
-            rows.append(_categorical_row(info, prop, categorical[info.column], y_all, props, cfg))
+            rows.append(
+                _categorical_row(info, prop, categorical[info.column], y_all, props, cfg,
+                                 numeric, dummies, by_name)
+            )
 
     table = pd.DataFrame(rows, columns=_TABLE_COLUMNS)
     if not table.empty:
@@ -674,24 +870,15 @@ def analyse(
             _strength(e, k) for e, k in zip(table["effect"], table["kind"])
         ]
 
-    collinearity = pd.DataFrame(index=[p.name for p in numeric_infos], columns=[p.name for p in numeric_infos], dtype=float)
-    for a in numeric_infos:
-        for b in numeric_infos:
-            pair = numeric[[a.column, b.column]].dropna() if a.column != b.column else numeric[[a.column]].dropna()
-            if a.column == b.column:
-                collinearity.loc[a.name, b.name] = 1.0
-            elif len(pair) >= 3 and pair[a.column].nunique() > 1 and pair[b.column].nunique() > 1:
-                collinearity.loc[a.name, b.name] = spearman(pair[a.column].to_numpy(), pair[b.column].to_numpy())[0]
-
     scaling = _scaling_laws(
-        metrics, numeric, props, prop_columns, cfg, categorical, categorical_infos
+        metrics, numeric, props, prop_columns, cfg, categorical, categorical_infos, table
     )
 
     return CorrelationResult(
         table=table,
         parameters=infos,
         properties=prop_columns,
-        collinearity=collinearity,
+        collinearity=association,
         scaling=scaling,
         props=props,
         numeric=numeric,
@@ -703,12 +890,68 @@ def analyse(
     )
 
 
+def _association_matrix(
+    infos: Sequence[ParameterInfo], numeric: pd.DataFrame, categorical: pd.DataFrame
+) -> pd.DataFrame:
+    """How entangled each pair of parameters is, whatever their kinds.
+
+    numeric-numeric: Spearman rho (signed); numeric-categorical: correlation
+    ratio eta; categorical-categorical: Cramer's V. All on a 0-1 magnitude
+    scale, so one threshold decides "too entangled to separate".
+    """
+    names = [p.name for p in infos]
+    matrix = pd.DataFrame(np.nan, index=names, columns=names, dtype=float)
+
+    def values(info: ParameterInfo) -> pd.Series:
+        if info.is_ordered:
+            return numeric[info.column]
+        return categorical[info.column].where(categorical[info.column].isin(info.levels))
+
+    for i, a in enumerate(infos):
+        matrix.loc[a.name, a.name] = 1.0
+        for b in infos[i + 1:]:
+            pair = pd.DataFrame({"a": values(a), "b": values(b)}).dropna()
+            if len(pair) < 3 or pair["a"].nunique() < 2 or pair["b"].nunique() < 2:
+                continue
+            if a.is_ordered and b.is_ordered:
+                value = spearman(pair["a"].to_numpy(float), pair["b"].to_numpy(float))[0]
+            elif a.is_ordered:
+                value = correlation_ratio(pair["a"].to_numpy(float), pair["b"].to_numpy())
+            elif b.is_ordered:
+                value = correlation_ratio(pair["b"].to_numpy(float), pair["a"].to_numpy())
+            else:
+                value = cramers_v(pair["a"].to_numpy(), pair["b"].to_numpy())
+            matrix.loc[a.name, b.name] = matrix.loc[b.name, a.name] = value
+    return matrix
+
+
+def _exclusions(info: ParameterInfo, by_name: dict[str, ParameterInfo]) -> tuple[list[str], list[str]]:
+    """(numeric columns, categorical factor names) not to hold fixed for `info`."""
+    twins = [by_name[name] for name in info.duplicates if name in by_name]
+    numeric_out = [t.column for t in twins if t.is_ordered]
+    factors_out = [t.name for t in twins if t.kind == "categorical"]
+    if info.is_ordered:
+        numeric_out.append(info.column)
+    else:
+        factors_out.append(info.name)
+    return numeric_out, factors_out
+
+
+def _confounding_note(info: ParameterInfo) -> str:
+    if not info.duplicates:
+        return ""
+    return (
+        f"confounded with {', '.join(info.duplicates)} -- not held fixed, as the data "
+        f"cannot separate them; read as one shared effect"
+    )
+
+
 _TABLE_COLUMNS = [
     "parameter", "parameter_column", "kind", "property", "n", "n_censored_excluded",
     "effect", "effect_measure", "effect_ci_lo", "effect_ci_hi", "p_value",
     "q_value", "significant", "strength", "direction",
     "pearson_r", "pearson_ci_lo", "pearson_ci_hi", "pearson_p",
-    "partial_rho", "partial_p", "partial_q", "partial_significant",
+    "partial_rho", "partial_eta_sq", "partial_p", "partial_q", "partial_significant",
     "partial_n", "partial_controls", "partial_reliable",
     "kruskal_H", "n_groups", "groups", "note",
 ]
@@ -719,7 +962,7 @@ def _base_row(info: ParameterInfo, prop: str, props: PropertyData) -> dict[str, 
     row.update(
         parameter=info.name, parameter_column=info.column, kind=info.kind,
         property=prop, n=0, n_censored_excluded=props.n_censored.get(prop, 0),
-        effect_measure="spearman_rho" if info.kind == "numeric" else "epsilon_squared",
+        effect_measure="epsilon_squared" if info.kind == "categorical" else "spearman_rho",
         direction="", groups="", note="", partial_controls="",
         significant=False, partial_significant=False, partial_reliable=False,
     )
@@ -734,6 +977,7 @@ def _numeric_row(
     y_all: pd.Series,
     props: PropertyData,
     cfg: AnalysisConfig,
+    by_name: dict[str, ParameterInfo] | None = None,
 ) -> dict[str, Any]:
     row = _base_row(info, prop, props)
     x_all = numeric[info.column]
@@ -761,9 +1005,11 @@ def _numeric_row(
     # Leaving a categorical confounder out is not neutral: with density held
     # fixed, a bigger cell can stand in for a stiffer topology and the partial
     # flips sign.
-    z, names = control_matrix(numeric, dummies, info.column, ok)
+    numeric_out, factors_out = _exclusions(info, by_name or {})
+    z, names = control_matrix(numeric, dummies, numeric_out, ok, factors_out)
+    confounded = _confounding_note(info)
     if not names:
-        row["note"] = "no other parameters to hold fixed"
+        row["note"] = confounded or "no other parameters to hold fixed"
         return row
     prho, pp, df, r2_x = partial_spearman(x, y, z)
     local_vif = _vif_from_r2(r2_x)
@@ -779,6 +1025,8 @@ def _numeric_row(
             f"largely determined by the other parameters (VIF {local_vif:.1f}); "
             f"partial estimate unreliable"
         )
+    if confounded:
+        row["note"] = "; ".join(x for x in (confounded, row["note"]) if x)
     return row
 
 
@@ -789,6 +1037,9 @@ def _categorical_row(
     y_all: pd.Series,
     props: PropertyData,
     cfg: AnalysisConfig,
+    numeric: pd.DataFrame | None = None,
+    dummies: pd.DataFrame | None = None,
+    by_name: dict[str, ParameterInfo] | None = None,
 ) -> dict[str, Any]:
     row = _base_row(info, prop, props)
     result = kruskal_effect(y_all, groups, cfg.correlation_min_group_size)
@@ -807,7 +1058,49 @@ def _categorical_row(
         groups=", ".join(f"{lvl} (n={result['counts'][lvl]}, median {med:.4g})"
                          for lvl, med in result["medians"].items()),
     )
+
+    # Partial: the same question with every other parameter held fixed. A
+    # batch or bed-position effect of a few percent is invisible next to
+    # pattern-to-pattern differences until those are accounted for.
+    if numeric is None or dummies is None:
+        return row
+    rows = y_all.notna() & groups.isin(list(result["counts"]))
+    numeric_out, factors_out = _exclusions(info, by_name or {})
+    z, names = control_matrix(numeric, dummies, numeric_out, rows, factors_out)
+    confounded = _confounding_note(info)
+    if not names:
+        row["note"] = confounded or "no other parameters to hold fixed"
+        return row
+    f_stat, p, eta2, r2_groups = quade_partial(
+        y_all[rows].to_numpy(float), groups[rows].to_numpy(), z
+    )
+    local_vif = _vif_from_r2(r2_groups)
+    reliable = bool(np.isfinite(p)) and local_vif < cfg.correlation_vif_threshold
+    row.update(
+        partial_eta_sq=eta2, partial_p=p, partial_n=int(rows.sum()),
+        partial_controls=", ".join(names), partial_reliable=reliable,
+    )
+    notes = [confounded]
+    if np.isfinite(p) and not reliable:
+        notes.append(
+            f"largely determined by the other parameters (VIF {local_vif:.1f}); "
+            f"partial estimate unreliable"
+        )
+    row["note"] = "; ".join(x for x in notes if x)
     return row
+
+
+def _strongest_factor(
+    table: pd.DataFrame | None, prop: str, infos: Sequence[ParameterInfo]
+) -> list[ParameterInfo]:
+    """The categorical factor that matters most for `prop` (as a 0/1-item list)."""
+    if table is None or table.empty or not infos:
+        return []
+    rows = table[(table["property"] == prop) & (table["kind"] == "categorical") & table["significant"]]
+    if rows.empty:
+        return []
+    best = rows.loc[rows["effect"].idxmax(), "parameter_column"]
+    return [i for i in infos if i.column == best]
 
 
 def _scaling_laws(
@@ -818,14 +1111,15 @@ def _scaling_laws(
     cfg: AnalysisConfig,
     categorical: pd.DataFrame | None = None,
     categorical_infos: Sequence[ParameterInfo] = (),
+    table: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Gibson-Ashby power laws of each modulus/strength property vs rho*.
 
     One row per property with a shared exponent ("all"), the categorical
     factors absorbed as per-level prefactors; then one row per level of the
-    first such factor that has enough tests, fitted on its own -- so a level
-    that genuinely scales differently (stretch- vs bending-dominated) shows
-    up rather than being averaged away.
+    factor with the strongest significant effect on that property, fitted on
+    its own -- so a level that genuinely scales differently (stretch- vs
+    bending-dominated) shows up rather than being averaged away.
     """
     columns = [
         "property", "kind", "group", "exponent", "ci_lo", "ci_hi", "prefactor",
@@ -861,7 +1155,7 @@ def _scaling_laws(
                 "held_fixed": ", ".join(held),
             }
         )
-        for info in categorical_infos[:1]:
+        for info in _strongest_factor(table, prop, categorical_infos):
             for level in info.levels:
                 mask = valid & (categorical[info.column] == level)
                 if int(mask.sum()) < cfg.correlation_min_n:
@@ -917,60 +1211,58 @@ def summarise(result: CorrelationResult, max_rows: int = 15) -> str:
         lines.append("    none")
     sig["abs_effect"] = sig["effect"].abs()
     for _, row in sig.sort_values(["q_value", "abs_effect"], ascending=[True, False]).head(max_rows).iterrows():
-        label = property_label(row["property"])
-        if row["kind"] == "numeric":
-            partial = (
-                f"  partial {row['partial_rho']:+.2f}"
-                if np.isfinite(row["partial_rho"]) and row["partial_reliable"]
-                else ""
-            )
-            lines.append(
-                f"    {row['parameter']:<22} → {label:<14} ρ = {row['effect']:+.2f}  "
-                f"q {_fmt_q(row['q_value']):<8} {row['strength']}{partial}"
-            )
-        else:
-            lines.append(
-                f"    {row['parameter']:<22} → {label:<14} ε² = {row['effect']:.2f}  "
-                f"q {_fmt_q(row['q_value']):<8} {row['strength']}  ({row['direction']})"
-            )
+        lines.append("    " + _summary_line(row))
     if len(sig) > max_rows:
         lines.append(f"    … {len(sig) - max_rows} more in correlations.csv")
 
-    never = [p.name for p in result.included if not sig["parameter"].eq(p.name).any()]
+    reliable = tested[tested["partial_reliable"].astype(bool)]
+    partial_sig = reliable[reliable["partial_significant"]]
+    never = [
+        p.name for p in result.included
+        if not sig["parameter"].eq(p.name).any() and not partial_sig["parameter"].eq(p.name).any()
+    ]
     if never:
-        lines.append(f"\n  No significant association with any property: {', '.join(never)}")
+        lines.append(f"\n  No association with any property, pairwise or partial: {', '.join(never)}")
 
-    numeric_rows = tested[(tested["kind"] == "numeric") & tested["partial_reliable"].astype(bool)]
-    masked = numeric_rows[~numeric_rows["significant"] & numeric_rows["partial_significant"]]
+    n_props = len(result.properties)
+    masked = reliable[~reliable["significant"] & reliable["partial_significant"]]
     if not masked.empty:
-        lines.append("\n  Hidden until other parameters are held fixed (masked effects):")
-        for _, row in masked.iterrows():
-            lines.append(
-                f"    {row['parameter']} → {property_label(row['property'])}: pairwise "
-                f"ρ = {row['effect']:+.2f} (n.s.), partial ρ = {row['partial_rho']:+.2f} "
-                f"(q {_fmt_q(row['partial_q'])})"
-            )
-    borrowed = numeric_rows[
-        numeric_rows["significant"]
-        & ~numeric_rows["partial_significant"]
-        & (numeric_rows["partial_rho"].abs() < 0.5 * numeric_rows["effect"].abs())
+        lines.append(
+            "\n  Hidden until other parameters are held fixed (masked effects; pairwise n.s. for these):"
+        )
+        lines += _grouped_lines(masked, n_props, partial=True)
+    borrowed = reliable[
+        reliable["significant"]
+        & ~reliable["partial_significant"]
+        & ((reliable["kind"] == "categorical") | (reliable["partial_rho"].abs() < 0.5 * reliable["effect"].abs()))
     ]
     if not borrowed.empty:
         lines.append("\n  Fades when other parameters are held fixed (likely borrowed from a correlated one):")
-        for _, row in borrowed.iterrows():
-            lines.append(
-                f"    {row['parameter']} → {property_label(row['property'])}: pairwise "
-                f"ρ = {row['effect']:+.2f}, partial ρ = {row['partial_rho']:+.2f}"
-            )
+        lines += _grouped_lines(borrowed, n_props, partial=False)
+    if any("isolated" in line for line in lines):
+        lines.append(
+            f"\n  * isolated: significant for one property only. At FDR {result.alpha:g}, about "
+            f"{result.alpha:.0%} of all discoveries are expected to be false, and a real\n"
+            f"    effect usually shows across related properties (strength, energy, modulus) -- "
+            f"treat these as leads to re-test, not findings."
+        )
 
     pairs = _collinear_pairs(result)
     if pairs:
-        lines.append(f"\n  Collinear parameters (|ρ| ≥ {result.collinear_rho:g}) — effects cannot be separated:")
-        for a, b, rho in pairs:
-            lines.append(f"    {a} ~ {b}  (ρ = {rho:+.2f})")
+        lines.append(
+            f"\n  Confounded parameters (association ≥ {result.collinear_rho:g}) — they move "
+            f"together, so the data cannot separate their effects:"
+        )
+        for a, b, value, measure in pairs:
+            lines.append(f"    {a} ~ {b}  ({measure} = {value:+.2f})" if measure == "ρ"
+                         else f"    {a} ~ {b}  ({measure} = {value:.2f})")
+        lines.append(
+            "    Each is tested without holding the other fixed; read a shared result as one "
+            "effect with two names."
+        )
     unreliable = [
         p for p in result.included
-        if p.kind == "numeric" and (p.vif == math.inf or (np.isfinite(p.vif) and p.vif >= result.vif_threshold))
+        if p.is_ordered and (p.vif == math.inf or (np.isfinite(p.vif) and p.vif >= result.vif_threshold))
     ]
     if unreliable:
         if not pairs:
@@ -981,17 +1273,19 @@ def summarise(result: CorrelationResult, max_rows: int = 15) -> str:
             + ", ".join(f"{p.name} ({p.vif:.0f})" if np.isfinite(p.vif) else f"{p.name} (∞)" for p in unreliable)
         )
         lines.append(
-            "    Their partial correlations are not shown. If one is derived from the others "
+            "    Partials withheld where still entangled. If one is derived from the others "
             "(relative density from cell and wall size, say),\n"
             "    analyse one set at a time: scripts/correlate.py --parameters <names>"
         )
 
-    cat_sig = sig[sig["kind"] == "categorical"]["parameter"].unique()
-    if len(cat_sig):
+    cat_sig = sorted(
+        set(sig[sig["kind"] == "categorical"]["parameter"])
+        | set(partial_sig[partial_sig["kind"] == "categorical"]["parameter"])
+    )
+    if cat_sig:
         lines.append(
-            f"\n  Categorical factors with an effect: {', '.join(cat_sig)} (held fixed in "
-            f"the partials). To look inside one level: scripts/correlate.py --where "
-            f"{cat_sig[0]}=<level>"
+            f"\n  Categorical factors with an effect: {', '.join(cat_sig)}. To look inside one "
+            f"level: scripts/correlate.py --where {cat_sig[0]}=<level>"
         )
 
     if not result.scaling.empty:
@@ -1021,14 +1315,69 @@ def summarise(result: CorrelationResult, max_rows: int = 15) -> str:
     return "\n".join(lines)
 
 
-def _collinear_pairs(result: CorrelationResult) -> list[tuple[str, str, float]]:
+def _grouped_lines(rows: pd.DataFrame, n_props: int, partial: bool) -> list[str]:
+    """One line per parameter, listing the properties it affects.
+
+    A parameter with a real effect on stiffness or strength normally shows it
+    across every related property; one that turns up for a single property
+    out of many is flagged as isolated.
+    """
+    out = []
+    for parameter, block in rows.groupby("parameter", sort=False):
+        kind = block["kind"].iloc[0]
+        values = block["partial_eta_sq" if kind == "categorical" else "partial_rho"] if partial \
+            else block["effect"]
+        symbol = ("η²" if kind == "categorical" else "ρ") if partial else ("ε²" if kind == "categorical" else "ρ")
+        lo, hi = float(values.min()), float(values.max())
+        fmt = "{:.2f}" if kind == "categorical" else "{:+.2f}"
+        span = fmt.format(lo) if math.isclose(lo, hi) else f"{fmt.format(lo)} to {fmt.format(hi)}"
+        labels = [property_label(p) for p in block["property"]]
+        shown = ", ".join(labels[:4]) + (f", +{len(labels) - 4} more" if len(labels) > 4 else "")
+        flag = "  *isolated" if len(block) == 1 and n_props >= 4 else ""
+        out.append(
+            f"    {parameter:<20} {'partial ' if partial else 'pairwise '}{symbol} {span} on "
+            f"{len(block)}/{n_props} properties ({shown}){flag}"
+        )
+    return out
+
+
+def _effect_text(row: pd.Series) -> str:
+    if row["kind"] == "categorical":
+        return f"ε² = {row['effect']:.2f}"
+    return f"ρ = {row['effect']:+.2f}"
+
+
+def _partial_text(row: pd.Series) -> str:
+    if row["kind"] == "categorical":
+        return f"η² = {row['partial_eta_sq']:.2f}"
+    return f"ρ = {row['partial_rho']:+.2f}"
+
+
+def _summary_line(row: pd.Series) -> str:
+    label = property_label(row["property"])
+    head = f"{row['parameter']:<22} → {label:<14} {_effect_text(row)}  q {_fmt_q(row['q_value']):<8} {row['strength']}"
+    if bool(row["partial_reliable"]) and np.isfinite(row["partial_p"]):
+        head += f"  partial {_partial_text(row).split(' = ')[1]}"
+    if row["kind"] == "categorical":
+        head += f"  ({row['direction']})"
+    elif row["kind"] == "datetime":
+        head += "  (later → higher)" if row["effect"] > 0 else "  (later → lower)"
+    return head
+
+
+def _collinear_pairs(result: CorrelationResult) -> list[tuple[str, str, float, str]]:
+    """(a, b, association, measure) for every pair too entangled to separate."""
+    kinds = {p.name: p for p in result.included}
     pairs = []
     names = list(result.collinearity.index)
     for i, a in enumerate(names):
         for b in names[i + 1:]:
-            rho = result.collinearity.loc[a, b]
-            if np.isfinite(rho) and abs(rho) >= result.collinear_rho:
-                pairs.append((a, b, float(rho)))
+            value = result.collinearity.loc[a, b]
+            if not (np.isfinite(value) and abs(value) >= result.collinear_rho):
+                continue
+            ka, kb = kinds[a].is_ordered, kinds[b].is_ordered
+            measure = "ρ" if ka and kb else "η" if ka or kb else "V"
+            pairs.append((a, b, float(value), measure))
     return pairs
 
 
@@ -1083,7 +1432,7 @@ def _heatmap(
 
 def plot_heatmap(result: CorrelationResult, out_path: str | Path, cfg: AnalysisConfig = DEFAULT_CONFIG) -> Path | None:
     """Numeric parameters × properties: pairwise ρ beside partial ρ."""
-    numeric_infos = [p for p in result.included if p.kind == "numeric"]
+    numeric_infos = [p for p in result.included if p.is_ordered]
     if not numeric_infos or not result.properties:
         return None
     rows = [p.column for p in numeric_infos]
@@ -1138,68 +1487,99 @@ def plot_heatmap(result: CorrelationResult, out_path: str | Path, cfg: AnalysisC
 
 
 def plot_categorical(result: CorrelationResult, out_path: str | Path, cfg: AnalysisConfig = DEFAULT_CONFIG) -> Path | None:
-    """Categorical factors × properties: epsilon-squared effect size."""
+    """Categorical factors × properties: effect size, pairwise beside partial.
+
+    Manufacturing factors (batch, bed position) tend to be small next to
+    pattern-to-pattern differences, so the partial panel is often where they
+    show up.
+    """
     infos = [p for p in result.included if p.kind == "categorical"]
     if not infos or not result.properties:
         return None
     cols = result.properties
-    values = np.full((len(infos), len(cols)), np.nan)
-    sig = np.zeros_like(values, bool)
+    shape = (len(infos), len(cols))
+    eps, eps_sig = np.full(shape, np.nan), np.zeros(shape, bool)
+    eta, eta_sig = np.full(shape, np.nan), np.zeros(shape, bool)
     for i, info in enumerate(infos):
         for j, prop in enumerate(cols):
             cell = result.cell(info.column, prop)
-            if cell is not None and np.isfinite(cell["effect"]):
-                values[i, j], sig[i, j] = cell["effect"], bool(cell["significant"])
-    texts = [[f"{v:.2f}" + ("*" if f else "") if np.isfinite(v) else "" for v, f in zip(vr, fr)] for vr, fr in zip(values, sig)]
+            if cell is None:
+                continue
+            if np.isfinite(cell["effect"]):
+                eps[i, j], eps_sig[i, j] = cell["effect"], bool(cell["significant"])
+            if bool(cell["partial_reliable"]) and np.isfinite(cell["partial_eta_sq"]):
+                eta[i, j], eta_sig[i, j] = cell["partial_eta_sq"], bool(cell["partial_significant"])
 
-    fig, ax = plt.subplots(figsize=(0.62 * len(cols) + 3.2, 0.42 * len(infos) + 2.4), layout="constrained")
+    def texts(values, flags):
+        return [[f"{v:.2f}" + ("*" if f else "") if np.isfinite(v) else "" for v, f in zip(vr, fr)]
+                for vr, fr in zip(values, flags)]
+
+    show_partial = bool(np.isfinite(eta).any())
+    ncols = 2 if show_partial else 1
+    fig, axes = plt.subplots(
+        1, ncols, figsize=(ncols * (0.62 * len(cols) + 0.4) + 3.0, 0.42 * len(infos) + 2.6),
+        squeeze=False, layout="constrained",
+    )
     fig.patch.set_facecolor(SURFACE)
     norm = Normalize(0, 0.6)
     labels = [f"{p.name} ({len(p.levels)} levels)" for p in infos]
-    image = _heatmap(ax, values, texts, sig, sequential_cmap(), norm, labels, [property_label(c) for c in cols])
-    bar = fig.colorbar(image, ax=ax, fraction=0.05, pad=0.02, extend="max")
-    bar.set_label("ε² (share of rank variance explained)", color=INK_SECONDARY, fontsize=9)
+    col_labels = [property_label(c) for c in cols]
+    image = _heatmap(axes[0, 0], eps, texts(eps, eps_sig), eps_sig, sequential_cmap(), norm, labels, col_labels)
+    axes[0, 0].set_title("Pairwise ε² (Kruskal–Wallis)", loc="left", fontsize=10, color=INK)
+    if show_partial:
+        _heatmap(axes[0, 1], eta, texts(eta, eta_sig), eta_sig, sequential_cmap(), norm,
+                 labels, col_labels, show_rows=False)
+        axes[0, 1].set_title("Partial η² (other parameters held fixed)", loc="left", fontsize=10, color=INK)
+    bar = fig.colorbar(image, ax=axes[0, :].tolist(), fraction=0.04, pad=0.02, extend="max")
+    bar.set_label("share of rank variance explained", color=INK_SECONDARY, fontsize=9)
     bar.ax.tick_params(colors=INK_SECONDARY, labelsize=8, length=0)
     bar.outline.set_visible(False)
-    ax.set_title("Categorical factors: effect size (Kruskal–Wallis ε²)", loc="left", fontsize=11, color=INK)
+    fig.suptitle("Categorical factors: how much does each one matter?", x=0.01, ha="left", fontsize=12, color=INK)
     fig.text(
         0.01, -0.01,
-        f"bold* = significant (FDR q < {result.alpha:g}) · 0.01 small, 0.08 medium, 0.26 large",
+        f"bold* = significant (FDR q < {result.alpha:g}) · 0.01 small, 0.08 medium, 0.26 large · "
+        f"partial: Quade rank analysis of covariance",
         fontsize=8, color=INK_MUTED, ha="left", va="top",
     )
     return save_figure(fig, out_path, cfg)
 
 
 def plot_collinearity(result: CorrelationResult, out_path: str | Path, cfg: AnalysisConfig = DEFAULT_CONFIG) -> Path | None:
-    """Spearman ρ between numeric parameters, with each one's VIF."""
-    infos = [p for p in result.included if p.kind == "numeric"]
+    """How entangled every pair of parameters is, numeric and categorical alike."""
+    infos = result.included
     if len(infos) < 2:
         return None
     names = [p.name for p in infos]
-    matrix = result.collinearity.loc[names, names].to_numpy(dtype=float)
+    matrix = np.abs(result.collinearity.loc[names, names].to_numpy(dtype=float))
     lower = np.tril(np.ones_like(matrix, bool), k=-1)
     shown = np.where(lower, matrix, np.nan)
-    flags = np.abs(np.nan_to_num(shown)) >= result.collinear_rho
-    texts = [[f"{v:+.2f}" if np.isfinite(v) else "" for v in row] for row in shown]
+    flags = np.nan_to_num(shown) >= result.collinear_rho
+    texts = [[f"{v:.2f}" if np.isfinite(v) else "" for v in row] for row in shown]
 
     size = 0.55 * len(infos) + 2.6
-    fig, ax = plt.subplots(figsize=(size + 1.2, size), layout="constrained")
+    fig, ax = plt.subplots(figsize=(size + 1.6, size), layout="constrained")
     fig.patch.set_facecolor(SURFACE)
-    vif_labels = [
-        f"{p.name}  (VIF {p.vif:.1f})" if np.isfinite(p.vif) else f"{p.name}  (VIF ∞)" if p.vif == math.inf else p.name
-        for p in infos
-    ]
-    image = _heatmap(ax, shown, texts, flags, diverging_cmap(), Normalize(-1, 1), vif_labels, names)
+    labels = []
+    for p in infos:
+        if p.is_ordered and np.isfinite(p.vif):
+            labels.append(f"{p.name}  (VIF {p.vif:.1f})")
+        elif p.is_ordered and p.vif == math.inf:
+            labels.append(f"{p.name}  (VIF ∞)")
+        else:
+            labels.append(p.name)
+    image = _heatmap(ax, shown, texts, flags, sequential_cmap(), Normalize(0, 1), labels, names)
     bar = fig.colorbar(image, ax=ax, fraction=0.05, pad=0.02)
-    bar.set_label("Spearman ρ between parameters", color=INK_SECONDARY, fontsize=9)
+    bar.set_label("association between parameters", color=INK_SECONDARY, fontsize=9)
     bar.ax.tick_params(colors=INK_SECONDARY, labelsize=8, length=0)
     bar.outline.set_visible(False)
-    ax.set_title("Parameter collinearity", loc="left", fontsize=11, color=INK)
+    ax.set_title("Which parameters move together?", loc="left", fontsize=11, color=INK)
     fig.text(
         0.01, -0.01,
-        f"bold = |ρ| ≥ {result.collinear_rho:g}: these move together in the data, so their "
-        f"separate effects cannot be told apart · VIF ≥ {result.vif_threshold:g} = partial ρ unreliable",
-        fontsize=8, color=INK_MUTED, ha="left", va="top", wrap=True,
+        f"numeric–numeric |Spearman ρ| · numeric–categorical correlation ratio η · "
+        f"categorical–categorical Cramér's V\n"
+        f"bold = ≥ {result.collinear_rho:g}: confounded, effects cannot be told apart · "
+        f"VIF ≥ {result.vif_threshold:g}: predictable from the rest combined",
+        fontsize=8, color=INK_MUTED, ha="left", va="top",
     )
     return save_figure(fig, out_path, cfg)
 
@@ -1229,7 +1609,9 @@ def plot_property(
     for ax, info in zip(axes.flat, infos):
         cell = result.cell(info.column, prop)
         _style_panel(ax, info.name)
-        if info.kind == "numeric":
+        if info.kind == "datetime":
+            ax.set_xlabel(f"days since {info.origin:%Y-%m-%d}", color=INK_MUTED, fontsize=7.5)
+        if info.is_ordered:
             x = result.numeric[info.column]
             ok = x.notna() & values.notna()
             ax.scatter(x[ok], values[ok], s=24, color=POINT_COLOR, alpha=0.8,
@@ -1305,11 +1687,13 @@ def _annotate_panel(ax: plt.Axes, cell: pd.Series | None, symbol: str) -> None:
         lines.append(
             (f"{symbol} = {value}{'*' if significant else ''}   q {_fmt_q(cell['q_value'])}", significant)
         )
-        if symbol == "ρ" and bool(cell["partial_reliable"]) and np.isfinite(cell["partial_rho"]):
+        partial = cell["partial_rho"] if symbol == "ρ" else cell["partial_eta_sq"]
+        if bool(cell["partial_reliable"]) and np.isfinite(partial):
             partial_sig = bool(cell["partial_significant"])
+            shown = f"{partial:+.2f}" if symbol == "ρ" else f"η² {partial:.2f}"
             lines.append(
                 (
-                    f"partial {cell['partial_rho']:+.2f}{'*' if partial_sig else ''}"
+                    f"partial {shown}{'*' if partial_sig else ''}"
                     + ("  ← masked effect" if partial_sig and not significant else ""),
                     partial_sig,
                 )
@@ -1370,7 +1754,13 @@ def plot_scaling(result: CorrelationResult, out_path: str | Path, cfg: AnalysisC
     fig.patch.set_facecolor(SURFACE)
     rho = result.numeric["relative_density"]
 
-    factor = next((p for p in result.included if p.kind == "categorical" and len(p.levels) <= len(CATEGORICAL)), None)
+    per_level = result.scaling[result.scaling["group"] != "all"]["group"]
+    factor_name = per_level.iloc[0].split("=", 1)[0] if not per_level.empty else None
+    factor = next(
+        (p for p in result.included
+         if p.kind == "categorical" and p.name == factor_name and len(p.levels) <= len(CATEGORICAL)),
+        None,
+    )
     groups = result.categorical[factor.column] if factor is not None else None
     palette = assign_colors(factor.levels) if factor is not None else {}
 

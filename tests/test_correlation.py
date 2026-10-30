@@ -35,6 +35,7 @@ from src.correlation import (
 from src.synthetic import planted_design
 
 GEOMETRY = ["cell_mm", "wall_mm", "topology", "layer_height_mm", "print_speed_mm_s", "nozzle_temp_C"]
+MANUFACTURING = ["print_batch", "bed_position"]
 
 
 def planted_metrics(n: int = 64, seed: int = 7, noise: float = 0.02) -> pd.DataFrame:
@@ -51,10 +52,15 @@ def planted_metrics(n: int = 64, seed: int = 7, noise: float = 0.02) -> pd.DataF
             "plateau_stress_MPa": d["true_plateau_MPa"] * rng.lognormal(0, noise, n),
             "first_peak_stress_MPa": d["true_peak_MPa"],
             "densification_strain": d["true_densification_strain"] + rng.normal(0, 0.005, n),
+            "print_date": d["print_date"],
+            "test_date": d["test_date"],
         }
     )
-    for column in GEOMETRY:
+    for column in GEOMETRY + MANUFACTURING:
         m[f"param_{column}"] = d[column]
+    m["param_print_to_test_days"] = (
+        pd.to_datetime(d["test_date"]) - pd.to_datetime(d["print_date"])
+    ).dt.total_seconds() / 86400.0
     return m
 
 
@@ -286,7 +292,7 @@ def test_gibson_ashby_exponents_are_recovered(result):
     modulus = shared.loc["modulus_MPa"]
     assert modulus["ci_lo"] <= 2.0 <= modulus["ci_hi"]
     assert "bending" in modulus["interpretation"]
-    assert modulus["held_fixed"] == "topology"
+    assert "topology" in modulus["held_fixed"].split(", ")
     plateau = shared.loc["plateau_stress_MPa"]
     assert plateau["ci_lo"] <= 1.5 <= plateau["ci_hi"]
 
@@ -324,8 +330,12 @@ def test_summary_tells_the_story(result):
     text = summarise(result)
     assert "Hidden until other parameters are held fixed" in text
     assert "layer_height_mm" in text
-    assert "No significant association with any property" in text
+    assert "No association with any property, pairwise or partial" in text
     assert "print_speed_mm_s" in text and "nozzle_temp_C" in text
+    # A parameter whose only effect is masked must not ALSO be listed as
+    # having no association -- the old wording contradicted itself.
+    none_line = next(l for l in text.splitlines() if "No association with any property" in l)
+    assert "layer_height_mm" not in none_line
     assert "relative_density" in text and "Largely predictable" in text
     assert "bending-dominated" in text
 
@@ -367,3 +377,109 @@ def test_nothing_to_analyse_is_reported_plainly():
     result = analyse(frame, DEFAULT_CONFIG)
     assert result.table.empty or not result.table["p_value"].notna().any()
     assert "Nothing could be tested" in summarise(result)
+
+
+# --------------------------------------------- manufacturing factors & dates ----
+from src.correlation import (  # noqa: E402
+    correlation_ratio,
+    cramers_v,
+    determination,
+    quade_partial,
+)
+
+
+def test_batch_effect_is_masked_pairwise_and_found_by_the_partial(result):
+    """Batch B3 is 12% weaker -- invisible next to 30x density spread."""
+    row = cell(result, "print_batch", "plateau_stress_MPa")
+    assert row["kind"] == "categorical"
+    assert not row["significant"], "pairwise should NOT see it"
+    assert row["partial_significant"] and row["partial_reliable"]
+
+
+def test_bed_edge_effect_is_found_by_the_partial(result):
+    row = cell(result, "bed_position", "modulus_MPa")
+    assert not row["significant"]
+    assert row["partial_significant"]
+
+
+def test_batch_and_print_date_are_reported_as_confounded(result):
+    """Each batch is printed on one day: one effect, two names."""
+    infos = {p.name: p for p in result.included}
+    assert "print_date" in infos["print_batch"].duplicates
+    assert "print_batch" in infos["print_date"].duplicates
+    # Neither is held fixed when testing the other -- that would erase both.
+    row = cell(result, "print_batch", "modulus_MPa")
+    assert "print_date" not in row["partial_controls"]
+    assert "confounded with print_date" in row["note"]
+    assert "print_batch ~ print_date" in summarise(result)
+
+
+def test_print_to_test_age_has_no_planted_effect(result):
+    rows = result.table[result.table["parameter"] == "print_to_test_days"]
+    assert not rows["significant"].any() and not rows["partial_significant"].any()
+
+
+def test_test_date_is_dropped_as_redundant_with_print_date_and_age(planted):
+    infos = {p.column: p for p in discover_parameters(planted, DEFAULT_CONFIG)}
+    assert not infos["test_date"].included
+    assert "redundant" in infos["test_date"].reason
+    # ...but can still be analysed on request.
+    asked = {p.column: p for p in discover_parameters(planted, DEFAULT_CONFIG, include=["test_date"])}
+    assert asked["test_date"].included
+
+
+def test_dates_are_analysed_as_elapsed_time(planted):
+    infos = {p.column: p for p in discover_parameters(planted, DEFAULT_CONFIG)}
+    printed = infos["print_date"]
+    assert printed.kind == "datetime" and printed.is_ordered
+    assert printed.origin == pd.Timestamp("2026-07-01")
+    assert "days since 2026-07-01" in printed.axis_label
+
+
+def test_topology_determined_by_a_ratio_is_not_trusted_as_separable(result):
+    """rho* = k_topology * wall / cell: linear in logs, not in ranks.
+
+    Ranks alone gave R^2 = 0.77 and passed topology's partial as reliable,
+    which then reported its effect as "borrowed" -- an artefact.
+    """
+    row = cell(result, "topology", "modulus_MPa")
+    assert not row["partial_reliable"]
+
+
+# ------------------------------------------------------- the new statistics ----
+def test_determination_sees_multiplicative_links():
+    rng = np.random.default_rng(4)
+    wall, cell_size = rng.uniform(0.6, 1.2, 80), rng.uniform(4, 8, 80)
+    ratio = wall / cell_size * (1 + rng.normal(0, 0.01, 80))
+    controls = np.column_stack([wall, cell_size])
+    assert determination(ratio, controls) > 0.95
+    assert determination(rng.uniform(size=80), controls) < 0.2
+
+
+def test_quade_finds_a_group_effect_hidden_behind_a_covariate():
+    rng = np.random.default_rng(5)
+    x = rng.uniform(1, 10, 90)
+    groups = np.repeat(["a", "b", "c"], 30)
+    y = 10 * x + np.where(groups == "b", 3.0, 0.0) + rng.normal(0, 1, 90)
+    assert stats.kruskal(*(y[groups == g] for g in "abc")).pvalue > 0.05
+    f_stat, p, eta2, r2_groups = quade_partial(y, groups, x[:, None])
+    assert p < 1e-4 and eta2 > 0.2 and r2_groups < 0.1
+
+
+def test_quade_is_calibrated_under_the_null():
+    rng = np.random.default_rng(6)
+    hits = 0
+    for _ in range(200):
+        x = rng.uniform(size=40)
+        y = x + rng.normal(0, 0.5, 40)
+        groups = rng.choice(["a", "b", "c", "d"], 40)
+        hits += quade_partial(y, groups, x[:, None])[1] < 0.05
+    assert 0.02 <= hits / 200 <= 0.09, hits
+
+
+def test_association_measures():
+    groups = np.repeat(["a", "b"], 20)
+    assert cramers_v(groups, groups) == pytest.approx(1.0)
+    assert correlation_ratio(np.r_[np.arange(20), np.arange(100, 120)], groups) > 0.85
+    rng = np.random.default_rng(7)
+    assert cramers_v(groups, rng.choice(["x", "y"], 40)) < 0.4

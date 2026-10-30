@@ -114,6 +114,11 @@ class AnalysisConfig:
     #: Minimum samples required inside the window before a plateau stress is
     #: reported (guards against tests that stop before 20% strain).
     plateau_min_points: int = 3
+    #: Fraction of the plateau window the test must actually span. A test that
+    #: stops partway through the window would average only its low end, which
+    #: biases the plateau low on the usual upward-sloping plateau; below this
+    #: coverage the plateau stress is not reported.
+    plateau_min_coverage: float = 0.9
 
     # ------------------------------------------------------------------
     # Densification onset (src.metrics)
@@ -131,6 +136,11 @@ class AnalysisConfig:
     densification_iso_multiple: float = 1.3
     #: Half-width, in strain, of the rolling window used for tangent modulus.
     tangent_window_strain: float = 0.01
+    #: A densification strain found within this much strain of the end of the
+    #: data is treated as "not reached": the criterion was still climbing when
+    #: the test stopped, so the value is a lower bound. Defined in strain
+    #: rather than samples so sampling noise cannot move the verdict.
+    densification_end_tolerance_strain: float = 0.01
 
     # ------------------------------------------------------------------
     # First peak / crush force (src.metrics)
@@ -140,6 +150,10 @@ class AnalysisConfig:
     #: A peak only counts as a *first peak* if the stress subsequently drops
     #: by at least this fraction of the peak value (i.e. real softening).
     first_peak_min_drop_frac: float = 0.02
+    #: Peaks and drops are judged on the curve smoothed over this much strain.
+    #: Load-cell noise on a soft specimen can otherwise fake a 2% "drop"; a
+    #: real buckling peak spans several percent strain and is unaffected.
+    first_peak_smoothing_strain: float = 0.003
 
     # ------------------------------------------------------------------
     # Energy absorption (src.metrics)
@@ -148,11 +162,62 @@ class AnalysisConfig:
     energy_fallback_strain: float = 0.50
 
     # ------------------------------------------------------------------
+    # Fixed-strain metrics (src.metrics)
+    # ------------------------------------------------------------------
+    #: Strains at which stress, absorbed energy and (with a mass) SEA are also
+    #: reported. These stay well-defined when a test is cut off by the load
+    #: limit -- unlike energy to densification, which then becomes only a lower
+    #: bound -- so they are the fair basis for comparing truncated tests.
+    fixed_strain_levels: tuple[float, ...] = (0.10, 0.20)
+
+    # ------------------------------------------------------------------
     # Envelope plotting (src.envelope)
     # ------------------------------------------------------------------
     envelope_n_points: int = 500
     envelope_per_pattern_bands: bool = True
     figure_dpi: int = 150
+    #: Up to this many patterns, each gets its own colour and legend entry.
+    #: Beyond it, colour can no longer identify a pattern, so tests are drawn
+    #: as plain data points with no per-pattern legend.
+    legend_max_patterns: int = 8
+    #: Colour curves and points by this parameter (e.g. "relative_density" or
+    #: a pattern_params key) on a continuous scale with a colorbar. None draws
+    #: them in a single colour, or by pattern when there are few patterns.
+    color_by: str | None = None
+
+    # ------------------------------------------------------------------
+    # Parameter-property correlation (src.correlation)
+    # ------------------------------------------------------------------
+    #: Properties tested against every parameter. Columns that are missing or
+    #: empty are skipped.
+    correlation_properties: tuple[str, ...] = (
+        "modulus_MPa",
+        "plateau_stress_MPa",
+        "first_peak_stress_MPa",
+        "stress_at_10pct_MPa",
+        "stress_at_20pct_MPa",
+        "energy_to_20pct_MJ_m3",
+        "sea_to_20pct_J_per_g",
+        "energy_absorption_MJ_m3",
+        "sea_J_per_g",
+        "densification_strain",
+    )
+    #: Fewest tests a parameter-property pair needs before it is tested.
+    correlation_min_n: int = 8
+    #: False-discovery-rate level for calling an association significant.
+    correlation_fdr_alpha: float = 0.05
+    #: A level of a categorical factor needs this many tests to take part.
+    correlation_min_group_size: int = 3
+    #: Parameters whose variance inflation factor exceeds this are too
+    #: entangled with the others for their partial correlation to be trusted.
+    correlation_vif_threshold: float = 10.0
+    #: Parameter pairs correlated at least this strongly are reported as
+    #: collinear: their separate effects cannot be told apart in the data.
+    correlation_collinear_rho: float = 0.8
+    #: Include values that are only lower bounds (test stopped at the load
+    #: limit before densifying). Off by default: correlating a bound against a
+    #: parameter mostly measures where each test happened to stop.
+    correlation_include_censored: bool = False
 
     # ------------------------------------------------------------------
 
@@ -174,8 +239,15 @@ class AnalysisConfig:
                 f"Unknown config key(s): {sorted(unknown)}. "
                 f"Valid keys: {sorted(known)}"
             )
-        if "expected_units" in data:
-            data = dict(data, expected_units=tuple(data["expected_units"]))
+        # JSON has lists, not tuples; restore tuples for tuple-valued fields so
+        # a config read from disk compares equal to one built in code.
+        tuple_fields = {
+            f.name for f in fields(cls) if isinstance(f.default, tuple)
+        }
+        data = {
+            k: tuple(v) if k in tuple_fields and isinstance(v, list) else v
+            for k, v in data.items()
+        }
         return cls(**data)
 
     def replace(self, **overrides: Any) -> "AnalysisConfig":

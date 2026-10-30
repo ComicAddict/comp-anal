@@ -56,6 +56,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help="cap the common strain grid instead of using the shortest test",
     )
+    parser.add_argument(
+        "--color-by",
+        metavar="PARAMETER",
+        help="colour curves and points by a parameter (e.g. relative_density, cell_mm)",
+    )
+    parser.add_argument(
+        "--no-correlation",
+        action="store_true",
+        help="skip the parameter-property correlation analysis",
+    )
 
     group = parser.add_argument_group("analysis parameter overrides")
     group.add_argument("--plateau-lo", type=float, help="plateau window start strain (0.20)")
@@ -148,16 +158,19 @@ def summarise(result, paths: PipelinePaths) -> None:
                     truncated["densification_at_end_of_data"].astype(bool)
                     | truncated["densification_strain"].isna()
                 ]
+            densified = len(truncated) - len(no_dens)
             if len(no_dens):
                 print(
                     f"  {len(no_dens)} of those never reached densification, so "
                     f"densification_strain,\n"
-                    f"  energy_absorption_* and SEA are LOWER BOUNDS for them."
+                    f"  energy_absorption_* and SEA are LOWER BOUNDS for them "
+                    f"(flagged, and left out of the correlation)."
                 )
-            if len(truncated) > len(no_dens):
+            if densified:
+                lead = "All of them" if not len(no_dens) else f"The other {densified}"
                 print(
-                    f"  The other {len(truncated) - len(no_dens)} did densify; only "
-                    f"energy integrated past that point is affected."
+                    f"  {lead} reached densification before stopping; only energy "
+                    f"beyond that point is cut off."
                 )
             print(
                 "  Modulus, plateau stress and first-peak metrics are unaffected "
@@ -173,9 +186,25 @@ def summarise(result, paths: PipelinePaths) -> None:
             )
             if c in metrics.columns
         ]
-        print("\nSummary:")
-        with pd.option_context("display.width", 160, "display.max_columns", None):
-            print(metrics[columns].to_string(index=False, float_format=lambda v: f"{v:.4g}"))
+        if len(metrics) <= 20:
+            print("\nSummary:")
+            with pd.option_context("display.width", 160, "display.max_columns", None):
+                print(metrics[columns].to_string(index=False, float_format=lambda v: f"{v:.4g}"))
+        else:
+            print(f"\n{len(metrics)} tests -- see {paths.metrics_csv} for the full table.")
+
+    if result.correlation is not None:
+        from src.correlation import summarise as correlation_summary
+
+        print("\n" + correlation_summary(result.correlation))
+        print(f"\n  tables  -> {paths.correlation_dir}/")
+        print(f"  figures -> {paths.correlation_figures_dir}/")
+    elif not result.skipped and "param_" not in " ".join(metrics.columns):
+        print(
+            "\nNo design/manufacturing parameters recorded, so no correlation "
+            "analysis.\n  Add them as extra columns in specimens.csv (one per "
+            "parameter) or in pattern_params."
+        )
 
 
 def run_once(paths: PipelinePaths, args: argparse.Namespace, cfg: AnalysisConfig) -> int:
@@ -186,6 +215,8 @@ def run_once(paths: PipelinePaths, args: argparse.Namespace, cfg: AnalysisConfig
             force=args.force,
             figures=not args.no_figures,
             strain_max=args.strain_max,
+            correlate=not args.no_correlation,
+            color_by=args.color_by,
         )
     except SpecimenError as exc:
         print(f"\nspecimens.csv problem:\n{exc}", file=sys.stderr)

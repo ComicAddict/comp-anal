@@ -169,14 +169,33 @@ def validate_row(row: dict[str, str]) -> None:
 
 
 def append_row(specimens_csv: Path, row: dict[str, str]) -> None:
-    """Append one row, creating the file with a header when it does not exist."""
+    """Append one row, creating the file with a header when it does not exist.
+
+    An existing file's own header is used as-is, so parameter columns the user
+    added by hand keep their place (left blank in the new row) instead of the
+    new row being written short and shifting every value after it.
+    """
     specimens_csv.parent.mkdir(parents=True, exist_ok=True)
     is_new = not specimens_csv.exists() or specimens_csv.stat().st_size == 0
+
+    fieldnames = list(COLUMNS)
+    if not is_new:
+        with specimens_csv.open(newline="", encoding="utf-8") as handle:
+            header = next(csv.reader(handle), [])
+        if header:
+            fieldnames = header + [c for c in COLUMNS if c not in header]
+            missing = [c for c in COLUMNS if c not in header]
+            if missing:
+                raise SpecimenError(
+                    f"{specimens_csv} is missing column(s) {missing}; add them "
+                    f"to its header before registering more tests"
+                )
+
     with specimens_csv.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(COLUMNS))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         if is_new:
             writer.writeheader()
-        writer.writerow({col: row.get(col, "") for col in COLUMNS})
+        writer.writerow({col: row.get(col, "") for col in fieldnames})
 
 
 def existing_ids(specimens_csv: Path) -> set[str]:
@@ -268,6 +287,12 @@ def write_template(paths, pending: list[str], skip: set[str]) -> int:
     print("  relative_density  specimen / bulk material density")
     print("  pattern_params    JSON, e.g. {\"cell_mm\": 5.0, \"wall_mm\": 0.8}")
     print("\ncross_section_area_mm2 can stay blank -- it is derived as side_length^2.")
+    print(
+        "\nTo correlate design and manufacturing parameters with the results, add one"
+        "\ncolumn per parameter (cell_mm, wall_mm, layer_height_mm, print_orientation,"
+        "\n...). Every extra column is picked up automatically -- see"
+        "\ndata/specimens.example.csv."
+    )
     if skip:
         print(f"\n{len(skip)} row(s) are marked as duplicate re-exports; see 'notes'.")
     return 0
@@ -380,7 +405,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             print(f"[dry-run] would append: {row}")
         else:
-            append_row(paths.specimens_csv, row)
+            try:
+                append_row(paths.specimens_csv, row)
+            except SpecimenError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
             known.add(row["test_id"])
             written += 1
             print(f"Registered {row['test_id']} -> {paths.specimens_csv}")

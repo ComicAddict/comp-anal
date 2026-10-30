@@ -23,6 +23,7 @@ from .mechanics import (
     cumulative_energy,
     energy_to_strain,
     tangent_modulus,
+    value_at_strain,
 )
 from .specimens import Specimen
 
@@ -78,6 +79,7 @@ class TestMetrics:
     plateau_stress_std_MPa: float = NAN
     plateau_strain_lo: float = NAN
     plateau_strain_hi: float = NAN
+    plateau_window_coverage: float = NAN
     densification: DensificationResult = field(default_factory=DensificationResult)
     energy_absorption_MJ_m3: float = NAN
     energy_absorption_J: float = NAN
@@ -88,6 +90,9 @@ class TestMetrics:
     max_force_N: float = NAN
     max_strain: float = NAN
     toe_compensation_applied: bool = False
+    #: Stress, energy and SEA at each `fixed_strain_levels` strain, keyed by
+    #: their output column name (see `fixed_strain_metrics`).
+    fixed_strain: dict[str, float] = field(default_factory=dict)
     diagnostics: list[Diagnostic] = field(default_factory=list)
 
     def as_row(self) -> dict[str, Any]:
@@ -105,6 +110,7 @@ class TestMetrics:
                 "plateau_stress_std_MPa": self.plateau_stress_std_MPa,
                 "plateau_strain_lo": self.plateau_strain_lo,
                 "plateau_strain_hi": self.plateau_strain_hi,
+                "plateau_window_coverage": self.plateau_window_coverage,
                 "densification_strain": self.densification.strain,
                 "densification_method": self.densification.method,
                 "densification_at_end_of_data": self.densification.at_end_of_data,
@@ -115,6 +121,7 @@ class TestMetrics:
                 "sea_basis": self.sea_basis,
             }
         )
+        row.update(self.fixed_strain)
         row.update({k: v for k, v in asdict(self.peaks).items()})
         row.update(
             {
@@ -306,10 +313,25 @@ def youngs_modulus(
 # ----------------------------------------------------------------------
 # Plateau
 # ----------------------------------------------------------------------
+def plateau_window_coverage(strain: np.ndarray, cfg: AnalysisConfig = DEFAULT_CONFIG) -> float:
+    """Fraction of the plateau window the test actually spans (0 to 1)."""
+    width = cfg.plateau_strain_hi - cfg.plateau_strain_lo
+    if len(strain) == 0 or width <= 0:
+        return NAN
+    reached = min(float(np.nanmax(strain)), cfg.plateau_strain_hi)
+    return float(np.clip((reached - cfg.plateau_strain_lo) / width, 0.0, 1.0))
+
+
 def plateau_stress(
     strain: np.ndarray, stress: np.ndarray, cfg: AnalysisConfig = DEFAULT_CONFIG
 ) -> tuple[float, float, list[Diagnostic]]:
-    """Mean (and std) stress between `plateau_strain_lo` and `..._hi`."""
+    """Mean (and std) stress between `plateau_strain_lo` and `..._hi`.
+
+    Not reported when the test stops well short of the window's upper end: the
+    mean would cover only the window's low end, and on the usual upward-sloping
+    plateau that reads low -- a number that looks like a plateau stress but
+    depends on where the test happened to stop.
+    """
     diags: list[Diagnostic] = []
     window = (strain >= cfg.plateau_strain_lo) & (strain <= cfg.plateau_strain_hi)
     count = int(window.sum())
@@ -324,6 +346,30 @@ def plateau_stress(
             )
         )
         return NAN, NAN, diags
+
+    coverage = plateau_window_coverage(strain, cfg)
+    if coverage < cfg.plateau_min_coverage:
+        diags.append(
+            Diagnostic(
+                "warning",
+                "plateau_window_partial",
+                f"the test covers only {coverage:.0%} of the "
+                f"{cfg.plateau_strain_lo:.0%}-{cfg.plateau_strain_hi:.0%} plateau "
+                f"window (max strain {float(np.nanmax(strain)):.3f}); plateau "
+                f"stress not reported. Lower plateau_strain_hi, or compare "
+                f"stress_at_* instead.",
+            )
+        )
+        return NAN, NAN, diags
+    if coverage < 1.0:
+        diags.append(
+            Diagnostic(
+                "info",
+                "plateau_window_partial",
+                f"plateau averaged over {coverage:.0%} of its window",
+            )
+        )
+
     values = stress[window]
     return float(np.mean(values)), float(np.std(values, ddof=1) if count > 1 else 0.0), diags
 
@@ -331,6 +377,16 @@ def plateau_stress(
 # ----------------------------------------------------------------------
 # Densification onset
 # ----------------------------------------------------------------------
+def _at_end_of_data(strain: np.ndarray, idx: int, cfg: AnalysisConfig) -> bool:
+    """True when a densification point sits too close to the end to trust.
+
+    Judged in strain, not samples: the criterion's maximum can wander a few
+    noisy samples back from the true end of a truncated test, and a sample
+    count would call that "reached".
+    """
+    return float(np.nanmax(strain)) - float(strain[idx]) <= cfg.densification_end_tolerance_strain
+
+
 def densification_energy_efficiency(
     strain: np.ndarray, stress: np.ndarray, cfg: AnalysisConfig = DEFAULT_CONFIG
 ) -> tuple[DensificationResult, list[Diagnostic]]:
@@ -371,7 +427,7 @@ def densification_energy_efficiency(
     eta = np.full(len(strain), np.nan)
     eta[valid] = work[valid] / stress[valid]
     idx = int(np.nanargmax(eta))
-    at_end = idx >= len(strain) - 2
+    at_end = _at_end_of_data(strain, idx, cfg)
 
     if at_end:
         diags.append(
@@ -447,7 +503,7 @@ def densification_tangent(
         DensificationResult(
             strain=float(strain[idx]),
             method="tangent",
-            at_end_of_data=idx >= len(strain) - 2,
+            at_end_of_data=_at_end_of_data(strain, idx, cfg),
         ),
         diags,
     )
@@ -483,7 +539,9 @@ def densification_iso(
     idx = int(hits[0])
     return (
         DensificationResult(
-            strain=float(strain[idx]), method="iso", at_end_of_data=idx >= len(strain) - 2
+            strain=float(strain[idx]),
+            method="iso",
+            at_end_of_data=_at_end_of_data(strain, idx, cfg),
         ),
         diags,
     )
@@ -513,6 +571,28 @@ def densification_strain(
 # ----------------------------------------------------------------------
 # First peak / crush force
 # ----------------------------------------------------------------------
+def _smooth(
+    strain: np.ndarray, values: np.ndarray, window_strain: float
+) -> tuple[np.ndarray, int]:
+    """Moving average over `window_strain`; returns (smoothed, window samples).
+
+    The window is set in strain, like every other window here, so it means the
+    same thing at any sample rate.
+    """
+    if window_strain <= 0 or len(values) < 3:
+        return values, 1
+    step = float(np.median(np.abs(np.diff(strain))))
+    if not np.isfinite(step) or step <= 0:
+        return values, 1
+    window = int(round(window_strain / step)) | 1  # odd, so it stays centred
+    if window < 3:
+        return values, 1
+    window = min(window, (len(values) // 2) * 2 - 1)
+    half = window // 2
+    padded = np.pad(values, half, mode="edge")
+    return np.convolve(padded, np.ones(window) / window, mode="valid"), window
+
+
 def first_peak(
     strain: np.ndarray,
     stress: np.ndarray,
@@ -547,18 +627,23 @@ def first_peak(
     result.crush_force_N = float(frc[max_idx])
     result.crush_stress_MPa = float(sig[max_idx])
 
-    span = float(np.nanmax(sig))
+    # Judge peaks and drops on a smoothed curve so noise cannot fake them,
+    # then report the measured (raw) maximum around the peak that was found.
+    smooth, window = _smooth(eps, sig, cfg.first_peak_smoothing_strain)
+    span = float(np.nanmax(smooth))
     if span <= 0:
         return result, diags
 
-    peaks, _ = find_peaks(sig, prominence=cfg.first_peak_prominence_frac * span)
+    peaks, _ = find_peaks(smooth, prominence=cfg.first_peak_prominence_frac * span)
     for p in peaks:
-        after = sig[p:]
+        after = smooth[p:]
         if after.size < 2:
             continue
         trough = float(np.nanmin(after))
-        drop = (sig[p] - trough) / sig[p] if sig[p] > 0 else 0.0
+        drop = (smooth[p] - trough) / smooth[p] if smooth[p] > 0 else 0.0
         if drop >= cfg.first_peak_min_drop_frac:
+            lo, hi = max(0, p - window // 2), min(len(sig), p + window // 2 + 1)
+            p = lo + int(np.nanargmax(sig[lo:hi]))
             result.first_peak_stress_MPa = float(sig[p])
             result.first_peak_strain = float(eps[p])
             result.first_peak_force_N = float(frc[p])
@@ -586,6 +671,46 @@ def first_peak(
             )
         )
     return result, diags
+
+
+# ----------------------------------------------------------------------
+# Fixed-strain metrics
+# ----------------------------------------------------------------------
+def strain_tag(level: float) -> str:
+    """Column-name fragment for a strain level: 0.1 -> "10pct", 0.125 -> "12.5pct"."""
+    return f"{round(level * 100, 6):g}pct"
+
+
+def fixed_strain_metrics(
+    strain: np.ndarray,
+    stress: np.ndarray,
+    spec: Specimen,
+    cfg: AnalysisConfig = DEFAULT_CONFIG,
+) -> dict[str, float]:
+    """Stress, absorbed energy and SEA at each `fixed_strain_levels` strain.
+
+    These are the comparable quantities for tests cut off by a load limit:
+    energy to *densification* is then only a lower bound, but energy to 20%
+    strain is a complete measurement for every test that got that far. A test
+    that stops short of a level gets NaN there rather than an extrapolation.
+    """
+    out: dict[str, float] = {}
+    reached_max = float(np.nanmax(strain)) if len(strain) else NAN
+    has_mass = spec.mass_g is not None and spec.mass_g > 0
+    for level in cfg.fixed_strain_levels:
+        tag = strain_tag(level)
+        reached = np.isfinite(reached_max) and reached_max >= level
+        stress_at = value_at_strain(strain, stress, level) if reached else NAN
+        energy = energy_to_strain(strain, stress, level) if reached else NAN
+        out[f"stress_at_{tag}_MPa"] = stress_at
+        out[f"energy_to_{tag}_MJ_m3"] = energy
+        # MPa * mm^3 = mJ; /1000 -> J; per gram -> J/g.
+        out[f"sea_to_{tag}_J_per_g"] = (
+            energy * spec.volume_mm3 / 1000.0 / spec.mass_g
+            if has_mass and np.isfinite(energy)
+            else NAN
+        )
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -623,6 +748,7 @@ def compute_metrics(
 
     plateau, plateau_std, d = plateau_stress(strain, stress, cfg)
     diagnostics += d
+    coverage = plateau_window_coverage(strain, cfg)
 
     dens, d = densification_strain(strain, stress, plateau, fit.modulus_MPa, cfg)
     diagnostics += d
@@ -663,6 +789,8 @@ def compute_metrics(
     peaks, d = first_peak(strain, stress, force, dens.strain, cfg)
     diagnostics += d
 
+    fixed = fixed_strain_metrics(strain, stress, spec, cfg)
+
     metrics = TestMetrics(
         test_id=spec.test_id,
         modulus=fit,
@@ -670,6 +798,7 @@ def compute_metrics(
         plateau_stress_std_MPa=plateau_std,
         plateau_strain_lo=cfg.plateau_strain_lo,
         plateau_strain_hi=cfg.plateau_strain_hi,
+        plateau_window_coverage=coverage,
         densification=dens,
         energy_absorption_MJ_m3=energy_MJ_m3,
         energy_absorption_J=energy_J,
@@ -680,6 +809,7 @@ def compute_metrics(
         max_force_N=float(np.nanmax(force)) if len(force) else NAN,
         max_strain=curve.max_strain,
         toe_compensation_applied=toe_applied,
+        fixed_strain=fixed,
         diagnostics=diagnostics,
     )
     return metrics, curve

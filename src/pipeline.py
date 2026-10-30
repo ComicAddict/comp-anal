@@ -15,14 +15,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from .config import DEFAULT_CONFIG, AnalysisConfig
 from .envelope import (
     build_curve_matrix,
+    display_name,
     plot_metric_space,
-    plot_metric_vs_param,
     plot_stress_strain_envelope,
+    resolve_column,
 )
 from .io import Diagnostic, load_test
 from .mechanics import StressStrainCurve, to_stress_strain
@@ -90,6 +92,14 @@ class PipelinePaths:
     def manifest_json(self) -> Path:
         return self.results_dir / ".input_manifest.json"
 
+    @property
+    def correlation_dir(self) -> Path:
+        return self.results_dir / "correlation"
+
+    @property
+    def correlation_figures_dir(self) -> Path:
+        return self.figures_dir / "correlation"
+
     @classmethod
     def from_root(cls, root: str | Path | None = None) -> "PipelinePaths":
         if root is None:
@@ -104,6 +114,8 @@ class PipelineResult:
     curves: dict[str, StressStrainCurve] = field(default_factory=dict)
     figures: list[Path] = field(default_factory=list)
     skipped: bool = False
+    correlation: Any = None          # CorrelationResult, when parameters vary
+    correlation_files: list[Path] = field(default_factory=list)
 
 
 # ----------------------------------------------------------------------
@@ -193,9 +205,42 @@ def analyse_specimen(
             "data_digest": data_digest(loaded.raw)[:16],
         }
     )
+    row.update(censor_flags(metrics, loaded.force_limited))
+
+    # Every design and manufacturing parameter, numeric or categorical, gets a
+    # param_<key> column -- that is what the correlation analysis reads.
     for key, value in spec.numeric_params().items():
         row[f"param_{key}"] = value
+    for key, value in spec.categorical_params().items():
+        row[f"param_{key}"] = value
     return row, diagnostics, final_curve
+
+
+def censor_flags(metrics: Any, force_limited: bool) -> dict[str, bool]:
+    """Which reported values are only lower bounds, not measurements.
+
+    A test stopped by the load limit before densifying still produces numbers
+    for densification strain and energy absorption, but they record where the
+    test stopped rather than what the specimen does. They stay in the table,
+    flagged, so the correlation analysis can leave them out instead of
+    correlating a parameter with the machine's cut-off.
+    """
+    dens = metrics.densification
+    dens_found = bool(np.isfinite(dens.strain))
+    dens_censored = dens_found and bool(dens.at_end_of_data)
+    return {
+        # Densification strain is a lower bound when it was still climbing at
+        # the end of the data.
+        "densification_censored": dens_censored,
+        # Energy to densification is a bound for the same reason -- and is not
+        # comparable at all when densification was never found and a fallback
+        # strain was used instead.
+        "energy_censored": dens_censored or not dens_found,
+        # Without a distinct first peak, "crush" load is the maximum before
+        # densification -- which, on a limit-stopped test, is the limit.
+        "crush_censored": bool(force_limited)
+        and not bool(metrics.peaks.has_distinct_first_peak),
+    }
 
 
 def _order_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -367,22 +412,39 @@ def make_figures(
     cfg: AnalysisConfig = DEFAULT_CONFIG,
     pairs: tuple[tuple[str, str], ...] = DEFAULT_PAIRS,
     strain_max: float | None = None,
+    color_by: str | None = None,
 ) -> list[Path]:
-    """Generate both envelope views. Returns the figures written."""
+    """Generate both envelope views. Returns the figures written.
+
+    `color_by` (default: `cfg.color_by`) names a parameter to colour curves and
+    points by. An unknown name is reported and ignored rather than failing the
+    whole run.
+    """
     paths.figures_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
 
+    color_by = color_by if color_by is not None else cfg.color_by
+    color_col = resolve_column(metrics, color_by)
+    if color_by and color_col is None:
+        print(
+            f"note: --color-by {color_by!r} matches no column; available "
+            f"parameters: {available_parameters(metrics) or 'none'}"
+        )
+
     # (a) Stress-strain overlay + shaded envelope.
-    items = [
-        (str(row.test_id), str(row.pattern_name), curves[str(row.test_id)])
-        for row in metrics.itertuples()
-        if str(row.test_id) in curves
-    ]
+    rows = [row for row in metrics.itertuples(index=False) if str(row.test_id) in curves]
+    items = [(str(r.test_id), str(r.pattern_name), curves[str(r.test_id)]) for r in rows]
     if items:
         matrix = build_curve_matrix(items, cfg.envelope_n_points, strain_max)
+        values = None
+        if color_col:
+            lookup = metrics.set_index(metrics["test_id"].astype(str))[color_col]
+            values = [lookup.get(t) for t in matrix.test_ids]
         written.append(
             plot_stress_strain_envelope(
-                matrix, paths.figures_dir / "stress_strain_envelope.png", cfg
+                matrix, paths.figures_dir / "stress_strain_envelope.png", cfg,
+                color_values=values,
+                color_label=display_name(color_col) if color_col else "",
             )
         )
         matrix.frame().to_csv(paths.results_dir / "resampled_curves.csv")
@@ -395,26 +457,21 @@ def make_figures(
             continue
         out = plot_metric_space(
             metrics, x, y, paths.figures_dir / f"metric_space_{y}_vs_{x}.png",
-            cfg, labels=LABELS,
+            cfg, labels=LABELS, color_by=color_col,
         )
         if out is not None:
             written.append(out)
 
-    # Metric vs swept numeric pattern parameter.
-    params = [c[len("param_") :] for c in metrics.columns if c.startswith("param_")]
-    for param in params:
-        for metric in ("modulus_MPa", "plateau_stress_MPa", "energy_absorption_MJ_m3"):
-            if metric not in metrics.columns:
-                continue
-            out = plot_metric_vs_param(
-                metrics, param, metric,
-                paths.figures_dir / f"param_{param}_{metric}.png",
-                cfg, labels=LABELS,
-            )
-            if out is not None:
-                written.append(out)
-
     return written
+
+
+def available_parameters(metrics: pd.DataFrame) -> list[str]:
+    """Parameter names a user can pass to --color-by."""
+    names = [display_name(c) for c in metrics.columns if c.startswith("param_")]
+    for core in ("relative_density", "material", "pattern_name"):
+        if core in metrics.columns:
+            names.append(core)
+    return names
 
 
 def run_pipeline(
@@ -423,8 +480,10 @@ def run_pipeline(
     force: bool = False,
     figures: bool = True,
     strain_max: float | None = None,
+    correlate: bool = True,
+    color_by: str | None = None,
 ) -> PipelineResult:
-    """Run analysis and figures, skipping if nothing changed (unless forced)."""
+    """Run analysis, figures and correlation, skipping if nothing changed."""
     if not force and not is_stale(paths, cfg):
         metrics = pd.read_csv(paths.metrics_csv)
         diagnostics = (
@@ -437,7 +496,33 @@ def run_pipeline(
     result = run_analysis(paths, cfg)
     if figures:
         result.figures = make_figures(
-            paths, result.metrics, result.curves, cfg, strain_max=strain_max
+            paths, result.metrics, result.curves, cfg,
+            strain_max=strain_max, color_by=color_by,
         )
+    if correlate:
+        run_correlation(paths, result, cfg, figures=figures)
     write_manifest(paths, cfg)
     return result
+
+
+def run_correlation(
+    paths: PipelinePaths,
+    result: PipelineResult,
+    cfg: AnalysisConfig = DEFAULT_CONFIG,
+    figures: bool = True,
+) -> None:
+    """Parameter-property correlation over the whole metrics table.
+
+    Outputs from an earlier run are cleared first, so removing a parameter
+    from specimens.csv cannot leave its old figures looking current.
+    """
+    from . import correlation
+
+    correlation.clear_outputs(paths.correlation_dir, paths.correlation_figures_dir)
+    if not correlation.has_parameters(result.metrics, cfg):
+        return
+    result.correlation = correlation.analyse(result.metrics, cfg)
+    result.correlation_files = correlation.write_outputs(
+        result.correlation, paths.correlation_dir, paths.correlation_figures_dir,
+        cfg, figures=figures,
+    )

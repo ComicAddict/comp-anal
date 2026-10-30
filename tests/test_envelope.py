@@ -7,13 +7,15 @@ import pandas as pd
 import pytest
 
 from src.config import DEFAULT_CONFIG
+import src.envelope as envelope
 from src.envelope import (
     CATEGORICAL,
-    assign_styles,
+    assign_colors,
     build_curve_matrix,
+    color_spec,
     plot_metric_space,
-    plot_metric_vs_param,
     plot_stress_strain_envelope,
+    resolve_column,
 )
 from src.mechanics import StressStrainCurve
 
@@ -31,25 +33,127 @@ def make_curve(test_id: str, scale: float, max_strain: float = 0.6) -> StressStr
     )
 
 
-# ----------------------------------------------------------------- styles ----
-def test_styles_are_stable_when_patterns_are_added():
+# ----------------------------------------------------------------- colour ----
+def test_colors_are_stable_when_patterns_are_added():
     """Colour follows the entity, not its rank in the current selection."""
-    first = assign_styles(["alpha", "gamma"])
-    second = assign_styles(["alpha", "beta", "gamma"])
-    assert first["alpha"].color == second["alpha"].color
+    first = assign_colors(["alpha", "gamma"])
+    second = assign_colors(["alpha", "beta", "gamma"])
+    assert first["alpha"] == second["alpha"]
 
 
-def test_styles_use_the_fixed_categorical_order():
-    styles = assign_styles(["a", "b", "c"])
-    assert [styles[k].color for k in ("a", "b", "c")] == list(CATEGORICAL[:3])
+def test_colors_use_the_fixed_categorical_order():
+    colors = assign_colors(["a", "b", "c"])
+    assert [colors[k] for k in ("a", "b", "c")] == list(CATEGORICAL[:3])
 
 
-def test_many_patterns_stay_distinguishable_by_shape():
-    """Past 8 patterns the colour repeats, so the marker must not."""
-    names = [f"p{i:02d}" for i in range(12)]
-    styles = assign_styles(names)
-    pairs = {(s.color, s.marker) for s in styles.values()}
-    assert len(pairs) == len(names), "two patterns share both colour and marker"
+def test_few_patterns_are_coloured_by_pattern():
+    spec = color_spec(["a", "b", "a"], DEFAULT_CONFIG)
+    assert spec.mode == "levels" and spec.by_pattern
+    assert [label for label, _ in spec.legend] == ["a", "b"]
+
+
+def test_many_patterns_become_plain_data_points():
+    """64 patterns cannot be told apart by colour: one colour, no legend."""
+    names = [f"pattern_{i:02d}" for i in range(64)]
+    spec = color_spec(names, DEFAULT_CONFIG)
+    assert spec.mode == "single"
+    assert spec.legend == []
+    assert len(set(spec.colors)) == 1
+
+
+def test_numeric_color_by_gives_a_continuous_scale():
+    values = np.linspace(0.1, 0.4, 64)
+    spec = color_spec([f"p{i}" for i in range(64)], DEFAULT_CONFIG, values, "relative_density")
+    assert spec.mode == "continuous"
+    assert spec.norm.vmin == pytest.approx(0.1) and spec.norm.vmax == pytest.approx(0.4)
+    # Darker for larger values on the one-hue ramp.
+    assert np.mean(spec.colors[-1][:3]) < np.mean(spec.colors[0][:3])
+
+
+def test_categorical_color_by_uses_levels_not_tests():
+    values = ["XY", "Z"] * 32
+    spec = color_spec([f"p{i}" for i in range(64)], DEFAULT_CONFIG, values, "orientation")
+    assert spec.mode == "levels" and not spec.by_pattern
+    assert [label for label, _ in spec.legend] == ["XY", "Z"]
+
+
+def test_missing_color_values_are_shown_as_missing():
+    spec = color_spec(["a", "b", "c"], DEFAULT_CONFIG, [0.1, None, 0.3], "rd")
+    assert spec.mode == "continuous"
+    assert spec.n_missing == 1
+    assert spec.colors[1] == envelope.MISSING_COLOR
+
+
+def test_resolve_column_accepts_bare_parameter_names():
+    frame = pd.DataFrame(columns=["relative_density", "param_cell_mm"])
+    assert resolve_column(frame, "cell_mm") == "param_cell_mm"
+    assert resolve_column(frame, "relative_density") == "relative_density"
+    assert resolve_column(frame, "nope") is None
+
+
+def capture_figure(monkeypatch):
+    """Intercept save_figure so a test can inspect the figure it was given."""
+    captured = {}
+
+    def fake_save(fig, out_path, cfg):
+        captured["fig"] = fig
+        return out_path
+
+    monkeypatch.setattr(envelope, "save_figure", fake_save)
+    return captured
+
+
+def legend_labels(fig) -> list[str]:
+    legend = fig.axes[0].get_legend()
+    return [] if legend is None else [t.get_text() for t in legend.get_texts()]
+
+
+def test_overlay_of_64_patterns_has_a_short_legend(monkeypatch, tmp_path):
+    captured = capture_figure(monkeypatch)
+    curves = [(f"t{i}", f"pattern_{i}", make_curve(f"t{i}", 5 + i * 0.3)) for i in range(64)]
+    plot_stress_strain_envelope(build_curve_matrix(curves, 100), tmp_path / "e.png")
+
+    labels = legend_labels(captured["fig"])
+    assert len(labels) <= 5, labels
+    assert not any(label.startswith("pattern_") for label in labels)
+    assert "Median across tests" in labels
+
+
+def test_scatter_of_64_patterns_uses_one_marker_and_no_legend(monkeypatch, tmp_path):
+    captured = capture_figure(monkeypatch)
+    metrics = pd.DataFrame(
+        {
+            "test_id": [f"t{i}" for i in range(64)],
+            "pattern_name": [f"pattern_{i}" for i in range(64)],
+            "modulus_MPa": np.linspace(10, 90, 64),
+            "plateau_stress_MPa": np.linspace(0.5, 3.0, 64),
+        }
+    )
+    plot_metric_space(metrics, "modulus_MPa", "plateau_stress_MPa", tmp_path / "m.png")
+    fig = captured["fig"]
+    assert fig.axes[0].get_legend() is None
+    collections = [c for c in fig.axes[0].collections if len(c.get_offsets()) == 64]
+    assert len(collections) == 1, "all tests should be one set of identical markers"
+
+
+def test_color_by_adds_a_colorbar_not_a_legend(monkeypatch, tmp_path):
+    captured = capture_figure(monkeypatch)
+    metrics = pd.DataFrame(
+        {
+            "test_id": [f"t{i}" for i in range(20)],
+            "pattern_name": [f"p{i}" for i in range(20)],
+            "modulus_MPa": np.linspace(10, 90, 20),
+            "plateau_stress_MPa": np.linspace(0.5, 3.0, 20),
+            "param_cell_mm": np.repeat([4.0, 5.0, 6.0, 8.0], 5),
+        }
+    )
+    plot_metric_space(
+        metrics, "modulus_MPa", "plateau_stress_MPa", tmp_path / "m.png",
+        color_by="cell_mm",
+    )
+    fig = captured["fig"]
+    assert len(fig.axes) == 2, "expected the plot plus a colorbar"
+    assert fig.axes[0].get_legend() is None
 
 
 # ----------------------------------------------------------------- matrix ----
@@ -154,28 +258,3 @@ def test_unknown_metric_raises(tmp_path):
     metrics = pd.DataFrame({"test_id": ["a"], "pattern_name": ["p"], "x": [1.0]})
     with pytest.raises(KeyError, match="nope"):
         plot_metric_space(metrics, "x", "nope", tmp_path / "x.png", DEFAULT_CONFIG)
-
-
-def test_metric_vs_param_figure(tmp_path):
-    metrics = pd.DataFrame(
-        {
-            "test_id": list("abcd"),
-            "pattern_name": ["gyroid"] * 4,
-            "param_cell_mm": [4.0, 5.0, 6.0, 7.0],
-            "modulus_MPa": [60.0, 45.0, 33.0, 25.0],
-        }
-    )
-    out = plot_metric_vs_param(
-        metrics, "cell_mm", "modulus_MPa", tmp_path / "p.png", DEFAULT_CONFIG
-    )
-    assert out is not None and out.exists()
-
-
-def test_metric_vs_param_returns_none_when_absent(tmp_path):
-    metrics = pd.DataFrame({"test_id": ["a"], "pattern_name": ["p"], "modulus_MPa": [1.0]})
-    assert (
-        plot_metric_vs_param(
-            metrics, "missing", "modulus_MPa", tmp_path / "n.png", DEFAULT_CONFIG
-        )
-        is None
-    )

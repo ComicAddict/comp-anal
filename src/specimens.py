@@ -4,12 +4,19 @@
 CSV to the pattern it belongs to and the geometry needed to turn force and
 displacement into stress and strain. It is hand-maintained (via
 `scripts/register_test.py`) and read-only for the analysis pipeline.
+
+Design and manufacturing parameters can be given two ways, and both may be
+used at once: as a JSON object in `pattern_params`, or -- easier for a large
+spreadsheet -- as extra columns, one per parameter (`cell_mm`,
+`layer_height_mm`, `print_orientation`, ...). Every column beyond the schema
+below is treated as a parameter.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -85,20 +92,43 @@ class Specimen:
     mass_g: float | None = None
     test_date: str | None = None
     notes: str | None = None
+    #: Values from any extra columns in specimens.csv, keyed by sanitised
+    #: column name. Numeric columns arrive as floats, the rest as strings.
+    extra_params: dict[str, Any] = field(default_factory=dict)
 
     @property
     def volume_mm3(self) -> float:
         """Bounding volume of the specimen along the load axis."""
         return self.cross_section_area_mm2 * self.initial_height_mm
 
+    def parameters(self) -> dict[str, Any]:
+        """Every design and manufacturing parameter recorded for this test.
+
+        The union of the `pattern_params` JSON and any extra columns. Conflicts
+        between the two were already rejected in `to_specimens`.
+        """
+        merged = dict(self.pattern_params)
+        merged.update(self.extra_params)
+        return merged
+
     def numeric_params(self) -> dict[str, float]:
-        """Subset of `pattern_params` whose values are numeric."""
+        """Parameters whose values are numeric."""
         out: dict[str, float] = {}
-        for key, value in self.pattern_params.items():
+        for key, value in self.parameters().items():
             if isinstance(value, bool):
                 continue
             if isinstance(value, (int, float)) and math.isfinite(float(value)):
                 out[key] = float(value)
+        return out
+
+    def categorical_params(self) -> dict[str, str]:
+        """Parameters whose values are labels (text or true/false)."""
+        out: dict[str, str] = {}
+        for key, value in self.parameters().items():
+            if isinstance(value, bool):
+                out[key] = "true" if value else "false"
+            elif isinstance(value, str) and value.strip():
+                out[key] = value.strip()
         return out
 
 
@@ -240,12 +270,102 @@ def validate_frame(frame: pd.DataFrame, raw_dir: Path | None = None) -> pd.DataF
     return frame
 
 
+def sanitise_name(name: str) -> str:
+    """Turn a spreadsheet header into a safe parameter key.
+
+    "Layer Height (mm)" -> "Layer_Height_mm". Case is kept, so the key still
+    reads like the header it came from.
+    """
+    return re.sub(r"[^0-9A-Za-z_]+", "_", str(name)).strip("_")
+
+
+def extra_parameter_columns(frame: pd.DataFrame) -> dict[str, str]:
+    """Map each extra (non-schema) column to its parameter key.
+
+    Any column beyond the documented schema is treated as a design or
+    manufacturing parameter, so parameters can be typed straight into the
+    spreadsheet one column each rather than as a JSON cell per row. Columns
+    pandas names "Unnamed: N" are the artefact of a trailing delimiter in an
+    Excel export, not data, and are skipped.
+    """
+    mapping: dict[str, str] = {}
+    for column in frame.columns:
+        if column in COLUMNS or str(column).startswith("Unnamed:"):
+            continue
+        key = sanitise_name(column)
+        if not key:
+            raise SpecimenError(
+                f"column {column!r} has no usable name once punctuation is "
+                f"removed; rename it, e.g. to 'param_1'"
+            )
+        if key in mapping.values():
+            other = next(c for c, k in mapping.items() if k == key)
+            raise SpecimenError(
+                f"columns {other!r} and {column!r} both become parameter "
+                f"{key!r}; rename one of them"
+            )
+        mapping[column] = key
+    return mapping
+
+
+def _numeric_columns(frame: pd.DataFrame, columns: list[str]) -> set[str]:
+    """Columns whose every non-blank cell parses as a number.
+
+    Decided per column, not per cell, so one parameter never ends up half
+    numeric and half text across tests.
+    """
+    numeric: set[str] = set()
+    for column in columns:
+        cells = frame[column].dropna().astype(str).str.strip()
+        cells = cells[cells != ""]
+        if cells.empty:
+            continue
+        if pd.to_numeric(cells, errors="coerce").notna().all():
+            numeric.add(column)
+    return numeric
+
+
+def _extra_values(
+    row: pd.Series, mapping: dict[str, str], numeric: set[str]
+) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for column, key in mapping.items():
+        cell = row.get(column)
+        if cell is None or (isinstance(cell, float) and pd.isna(cell)):
+            continue
+        text = str(cell).strip()
+        if not text:
+            continue
+        values[key] = float(text) if column in numeric else text
+    return values
+
+
+def _merge_conflicts(
+    json_params: dict[str, Any], extra: dict[str, Any]
+) -> list[str]:
+    """Keys set in both places to different values for the same test."""
+    conflicts = []
+    for key in set(json_params) & set(extra):
+        a, b = json_params[key], extra[key]
+        try:
+            same = float(a) == float(b)
+        except (TypeError, ValueError):
+            same = str(a).strip() == str(b).strip()
+        if not same:
+            conflicts.append(f"{key!r} is {a!r} in pattern_params but {b!r} in its column")
+    return conflicts
+
+
 def to_specimens(frame: pd.DataFrame) -> list[Specimen]:
     """Convert a validated frame into `Specimen` objects.
 
     `cross_section_area_mm2` is derived from `side_length_mm` (square section)
-    when the cell is blank, matching the documented override behaviour.
+    when the cell is blank, matching the documented override behaviour. Extra
+    columns become parameters (see `extra_parameter_columns`).
     """
+    mapping = extra_parameter_columns(frame)
+    numeric = _numeric_columns(frame, list(mapping))
+
     out: list[Specimen] = []
     for _, row in frame.iterrows():
         test_id = str(row["test_id"]).strip()
@@ -259,6 +379,16 @@ def to_specimens(frame: pd.DataFrame) -> list[Specimen]:
         if height <= 0:
             raise SpecimenError(f"[{test_id}] initial_height_mm must be > 0")
 
+        json_params = _parse_params(row.get("pattern_params"), test_id)
+        extra = _extra_values(row, mapping, numeric)
+        conflicts = _merge_conflicts(json_params, extra)
+        if conflicts:
+            raise SpecimenError(
+                f"[{test_id}] parameter given twice with different values: "
+                + "; ".join(conflicts)
+                + ". Keep it in one place."
+            )
+
         out.append(
             Specimen(
                 test_id=test_id,
@@ -269,11 +399,12 @@ def to_specimens(frame: pd.DataFrame) -> list[Specimen]:
                 cross_section_area_mm2=area,
                 initial_height_mm=height,
                 material=str(row["material"]).strip(),
-                pattern_params=_parse_params(row.get("pattern_params"), test_id),
+                pattern_params=json_params,
                 relative_density=_opt_float(row.get("relative_density")),
                 mass_g=_opt_float(row.get("mass_g")),
                 test_date=_opt_str(row.get("test_date")),
                 notes=_opt_str(row.get("notes")),
+                extra_params=extra,
             )
         )
     return out

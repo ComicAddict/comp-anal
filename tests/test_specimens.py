@@ -152,3 +152,74 @@ def test_numeric_params_ignores_non_numeric_values(tmp_path):
     row = dict(GOOD_ROW, pattern_params='{"cell_mm": 5, "kind": "auxetic", "on": true}')
     path = write_csv(tmp_path / "specimens.csv", [row])
     assert load_specimens(path)[0].numeric_params() == {"cell_mm": 5.0}
+
+
+# ------------------------------------------------- extra parameter columns ----
+def write_with_extra(path: Path, extra_header: list[str], extra_rows: list[list[str]]):
+    """GOOD_ROW (one per extra row) followed by user-added parameter columns."""
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(list(COLUMNS) + extra_header)
+        for i, extra in enumerate(extra_rows):
+            row = dict(GOOD_ROW, test_id=f"t{i}", raw_file=f"t{i}.csv")
+            writer.writerow([row[c] for c in COLUMNS] + extra)
+    return path
+
+
+def test_extra_columns_become_parameters(tmp_path):
+    """A parameter per column is easier than a JSON cell per row."""
+    path = write_with_extra(
+        tmp_path / "specimens.csv",
+        ["layer_height_mm", "orientation"],
+        [["0.2", "XY"], ["0.28", "Z"]],
+    )
+    spec = load_specimens(path)[0]
+    assert spec.parameters()["layer_height_mm"] == pytest.approx(0.2)
+    assert spec.numeric_params()["layer_height_mm"] == pytest.approx(0.2)
+    assert spec.categorical_params() == {"orientation": "XY"}
+    # JSON parameters are still there alongside them.
+    assert spec.numeric_params()["cell_mm"] == pytest.approx(5.0)
+
+
+def test_column_type_is_decided_per_column(tmp_path):
+    """One stray text cell makes the whole column categorical, not half of it."""
+    path = write_with_extra(
+        tmp_path / "specimens.csv", ["nozzle"], [["0.4"], ["0.6"], ["hardened"]]
+    )
+    specs = load_specimens(path)
+    assert all("nozzle" in s.categorical_params() for s in specs)
+    assert all("nozzle" not in s.numeric_params() for s in specs)
+
+
+def test_blank_extra_cells_are_missing_not_zero(tmp_path):
+    path = write_with_extra(tmp_path / "specimens.csv", ["infill"], [["15"], [""]])
+    specs = load_specimens(path)
+    assert specs[0].numeric_params()["infill"] == pytest.approx(15.0)
+    assert "infill" not in specs[1].parameters()
+
+
+def test_spreadsheet_headers_are_sanitised(tmp_path):
+    path = write_with_extra(tmp_path / "specimens.csv", ["Layer Height (mm)"], [["0.2"]])
+    assert "Layer_Height_mm" in load_specimens(path)[0].numeric_params()
+
+
+def test_excel_trailing_delimiter_columns_are_ignored(tmp_path):
+    path = write_with_extra(tmp_path / "specimens.csv", ["speed", ""], [["60", ""]])
+    params = load_specimens(path)[0].parameters()
+    assert "speed" in params
+    assert not any(k.startswith("Unnamed") for k in params)
+
+
+def test_parameter_given_twice_must_agree(tmp_path):
+    clash = write_with_extra(tmp_path / "clash.csv", ["cell_mm"], [["6"]])
+    with pytest.raises(SpecimenError, match="given twice"):
+        load_specimens(clash)
+
+    agree = write_with_extra(tmp_path / "agree.csv", ["cell_mm"], [["5.0"]])
+    assert load_specimens(agree)[0].numeric_params()["cell_mm"] == pytest.approx(5.0)
+
+
+def test_headers_that_collide_after_sanitising_are_rejected(tmp_path):
+    path = write_with_extra(tmp_path / "s.csv", ["cell mm", "cell-mm"], [["5", "5"]])
+    with pytest.raises(SpecimenError, match="both become parameter"):
+        load_specimens(path)

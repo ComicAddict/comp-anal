@@ -456,3 +456,135 @@ def test_register_then_analyse_round_trip(tmp_path):
     metrics = pd.read_csv(tmp_path / "results" / "metrics_summary.csv")
     assert len(metrics) == 2
     assert metrics["modulus_MPa"].notna().all()
+
+
+# ------------------------------------------------------------ correlation ----
+@pytest.fixture(scope="module")
+def doe_root(tmp_path_factory):
+    """A 20-test planted design space, generated as raw curves and analysed."""
+    import make_demo_data
+
+    root = tmp_path_factory.mktemp("doe")
+    make_demo_data.build(root, n_tests=20, seed=3)
+    cfg = DEFAULT_CONFIG.replace(force_limit_kN=9.5)
+    run_pipeline(PipelinePaths.from_root(root), cfg)
+    return root
+
+
+def test_extra_specimen_columns_reach_the_metrics_table(doe_root):
+    metrics = pd.read_csv(doe_root / "results" / "metrics_summary.csv")
+    for column in ("param_cell_mm", "param_wall_mm", "param_layer_height_mm", "param_topology"):
+        assert column in metrics.columns
+    assert set(metrics["param_topology"]) == {"gyroid", "honeycomb"}
+
+
+def test_censor_flags_and_fixed_strain_metrics_are_written(doe_root):
+    metrics = pd.read_csv(doe_root / "results" / "metrics_summary.csv")
+    for column in (
+        "densification_censored", "energy_censored", "crush_censored",
+        "stress_at_10pct_MPa", "stress_at_20pct_MPa", "energy_to_20pct_MJ_m3",
+        "sea_to_20pct_J_per_g", "plateau_window_coverage",
+    ):
+        assert column in metrics.columns, column
+    assert metrics["stress_at_20pct_MPa"].notna().all()
+
+
+def test_correlation_runs_as_part_of_the_pipeline(doe_root):
+    tables = doe_root / "results" / "correlation"
+    figures = doe_root / "results" / "figures" / "correlation"
+    assert (tables / "correlations.csv").exists()
+    assert (tables / "summary.txt").exists()
+    assert (figures / "heatmap.png").exists()
+    assert (figures / "property_modulus_MPa.png").exists()
+
+    table = pd.read_csv(tables / "correlations.csv")
+    row = table[(table["parameter"] == "relative_density") & (table["property"] == "modulus_MPa")].iloc[0]
+    assert row["effect"] > 0.8 and row["significant"]
+
+
+def test_no_parameters_means_no_correlation_outputs(dataset):
+    """The two-pattern fixture records no varying parameters beyond pattern."""
+    paths = PipelinePaths.from_root(dataset)
+    specimens = pd.read_csv(paths.specimens_csv)
+    specimens["pattern_params"] = "{}"
+    specimens["relative_density"] = 0.3
+    specimens.to_csv(paths.specimens_csv, index=False)
+
+    # Leave a stale summary behind, as an earlier run with parameters would.
+    paths.correlation_dir.mkdir(parents=True)
+    (paths.correlation_dir / "summary.txt").write_text("stale")
+
+    result = run_pipeline(paths, DEFAULT_CONFIG, force=True)
+    assert result.correlation is None
+    assert not (paths.correlation_dir / "summary.txt").exists()
+
+
+def test_correlate_cli_list_where_and_parameters(doe_root, capsys):
+    import correlate as cli
+
+    assert cli.main(["--root", str(doe_root), "--list"]) == 0
+    out = capsys.readouterr().out
+    assert "layer_height_mm" in out and "unique per test" in out
+
+    assert cli.main(["--root", str(doe_root), "--where", "topology=gyroid", "--no-figures"]) == 0
+    sub = doe_root / "results" / "correlation" / "where_topology-gyroid"
+    assert (sub / "correlations.csv").exists()
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(doe_root), "--parameters", "cell_mm", "wall_mm", "--no-figures"]) == 0
+    table = pd.read_csv(doe_root / "results" / "correlation" / "correlations.csv")
+    assert set(table["parameter"]) == {"cell_mm", "wall_mm"}
+
+
+def test_correlate_cli_rejects_bad_where(doe_root, capsys):
+    import correlate as cli
+
+    with pytest.raises(SystemExit, match="no tests with topology"):
+        cli.main(["--root", str(doe_root), "--where", "topology=octet"])
+    with pytest.raises(SystemExit, match="matches no column"):
+        cli.main(["--root", str(doe_root), "--where", "nope=1"])
+
+
+def test_correlate_cli_needs_metrics(tmp_path, capsys):
+    import correlate as cli
+
+    assert cli.main(["--root", str(tmp_path)]) == 2
+    assert "run_analysis.py" in capsys.readouterr().err
+
+
+def test_color_by_is_accepted_and_unknown_names_are_reported(doe_root, capsys):
+    import plot_envelope as cli
+
+    assert cli.main(["--root", str(doe_root), "--color-by", "relative_density"]) == 0
+    assert cli.main(["--root", str(doe_root), "--color-by", "not_a_parameter"]) == 0
+    assert "matches no column" in capsys.readouterr().out
+
+
+def test_register_append_keeps_user_added_columns_aligned(tmp_path):
+    """Appending must not shift values under a header with extra columns."""
+    import csv
+
+    import register_test as cli
+    from src.specimens import COLUMNS
+    from src.synthetic import SyntheticTest
+
+    raw_dir = tmp_path / "data" / "raw"
+    for name in ("a.csv", "b.csv"):
+        SyntheticTest(name=name, seed=1).write(raw_dir / name)
+    specimens = tmp_path / "data" / "specimens.csv"
+    with specimens.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(list(COLUMNS) + ["layer_height_mm"])
+        row = {c: "" for c in COLUMNS}
+        row.update(test_id="a", raw_file="a.csv", pattern_name="p", replicate="1",
+                   side_length_mm="20", initial_height_mm="20", material="PLA")
+        writer.writerow([row[c] for c in COLUMNS] + ["0.2"])
+
+    args = ["--root", str(tmp_path), "--raw-file", "b.csv", "--pattern-name", "p",
+            "--replicate", "2", "--side-length-mm", "20", "--material", "PLA"]
+    assert cli.main(args) == 0
+
+    frame = pd.read_csv(specimens, dtype=str)
+    assert list(frame.columns) == list(COLUMNS) + ["layer_height_mm"]
+    assert frame.loc[1, "material"] == "PLA", "values shifted under the header"
+    assert pd.isna(frame.loc[1, "layer_height_mm"])

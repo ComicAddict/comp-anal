@@ -3,11 +3,11 @@
 
     python scripts/plot_envelope.py                       # both views, defaults
     python scripts/plot_envelope.py --pair modulus_MPa plateau_stress_MPa
-    python scripts/plot_envelope.py --param cell_mm       # metric vs swept parameter
+    python scripts/plot_envelope.py --color-by relative_density  # colour by a parameter
     python scripts/plot_envelope.py --watch               # redraw on any change
 
 Reads results/metrics_summary.csv and results/curves/, so it does not re-parse
-the raw files. If those are missing or stale, run scripts/run_analysis.py first
+the raw files. Parameter-vs-property plots come from scripts/correlate.py. If those are missing or stale, run scripts/run_analysis.py first
 (or pass --run-analysis to do it here).
 """
 
@@ -49,14 +49,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="metric pair to scatter; repeatable (default: a standard set)",
     )
     parser.add_argument(
-        "--param",
-        action="append",
-        help="numeric pattern_params key to plot metrics against; repeatable",
-    )
-    parser.add_argument(
         "--strain-max",
         type=float,
         help="cap the common strain grid instead of using the shortest test",
+    )
+    parser.add_argument(
+        "--color-by",
+        metavar="PARAMETER",
+        help="colour curves and points by a parameter (e.g. relative_density, cell_mm)",
     )
     parser.add_argument(
         "--no-per-pattern-bands",
@@ -110,7 +110,7 @@ def draw(paths: PipelinePaths, args: argparse.Namespace, cfg: AnalysisConfig) ->
             print(f"  {column}")
         params = [c for c in metrics.columns if c.startswith("param_")]
         if params:
-            print("Numeric pattern_params:")
+            print("Parameters (usable with --color-by):")
             for column in params:
                 print(f"  {column[len('param_'):]}")
         return 0
@@ -141,18 +141,9 @@ def draw(paths: PipelinePaths, args: argparse.Namespace, cfg: AnalysisConfig) ->
                 return 1
 
     figures = make_figures(
-        paths, metrics, curves, cfg, pairs=pairs, strain_max=args.strain_max
+        paths, metrics, curves, cfg, pairs=pairs, strain_max=args.strain_max,
+        color_by=args.color_by,
     )
-
-    if args.param:
-        available = {c[len("param_") :] for c in metrics.columns if c.startswith("param_")}
-        for param in args.param:
-            if param not in available:
-                print(
-                    f"warning: no numeric pattern_params key {param!r} "
-                    f"(available: {sorted(available) or 'none'})",
-                    file=sys.stderr,
-                )
 
     print(f"Wrote {len(figures)} figure(s) to {paths.figures_dir}/")
     for figure in figures:

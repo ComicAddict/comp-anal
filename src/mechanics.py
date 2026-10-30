@@ -111,20 +111,53 @@ def cumulative_energy(strain: np.ndarray, stress: np.ndarray) -> np.ndarray:
     return out
 
 
+def _first_crossing(strain: np.ndarray, level: float) -> int | None:
+    """Index of the first sample at or beyond `level`, or None if never reached.
+
+    "First" matters: measured strain can step back by a hair through noise, so
+    a mask like `strain <= level` would also pick up stray samples from after
+    the crossing and fold them into the integral out of order.
+    """
+    reached = np.flatnonzero(strain >= level)
+    return int(reached[0]) if reached.size else None
+
+
+def value_at_strain(strain: np.ndarray, values: np.ndarray, level: float) -> float:
+    """`values` interpolated at the first point the curve reaches `level`.
+
+    NaN when the test never reaches that strain -- an extrapolated stress is
+    not a measurement.
+    """
+    if not np.isfinite(level) or len(strain) < 2:
+        return float("nan")
+    k = _first_crossing(strain, level)
+    if k is None:
+        return float("nan")
+    if k == 0:
+        return float(values[0])
+    x0, x1 = float(strain[k - 1]), float(strain[k])
+    y0, y1 = float(values[k - 1]), float(values[k])
+    if x1 == x0:
+        return y1
+    return y0 + (y1 - y0) * (level - x0) / (x1 - x0)
+
+
 def energy_to_strain(strain: np.ndarray, stress: np.ndarray, limit: float) -> float:
-    """integral(sigma d(epsilon)) from 0 to `limit`, interpolating the endpoint."""
+    """integral(sigma d(epsilon)) from 0 to `limit`, interpolating the endpoint.
+
+    Integrates up to the first time the curve reaches `limit`. When it never
+    does, the whole curve is integrated (the limit is clipped to the data);
+    callers that need a strict "reached or NaN" check do it themselves.
+    """
     if not np.isfinite(limit) or len(strain) < 2:
         return float("nan")
-    limit = min(limit, float(strain[-1]))
-    mask = strain <= limit
-    if mask.sum() < 2:
+    k = _first_crossing(strain, limit)
+    if k is None:
+        return float(_trapezoid(stress, strain))
+    if k == 0:
         return 0.0
-    eps = strain[mask]
-    sig = stress[mask]
-    if eps[-1] < limit and limit <= strain[-1]:
-        sig_end = float(np.interp(limit, strain, stress))
-        eps = np.append(eps, limit)
-        sig = np.append(sig, sig_end)
+    eps = np.append(strain[:k], limit)
+    sig = np.append(stress[:k], value_at_strain(strain, stress, limit))
     return float(_trapezoid(sig, eps))
 
 

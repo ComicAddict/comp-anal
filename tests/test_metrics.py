@@ -197,3 +197,149 @@ def test_crush_force_excludes_the_densification_rise(clean_curve):
     strain, stress, spec = clean_curve
     result, _ = first_peak(strain, stress, stress * 400.0, 0.50, DEFAULT_CONFIG)
     assert result.crush_stress_MPa < stress.max() / 2
+
+
+# ------------------------------------------------------ fixed-strain metrics ----
+from src.metrics import (  # noqa: E402
+    fixed_strain_metrics,
+    plateau_window_coverage,
+    strain_tag,
+)
+from src.specimens import Specimen  # noqa: E402
+
+SPEC = Specimen(
+    test_id="t",
+    raw_file="t.csv",
+    pattern_name="p",
+    replicate=1,
+    side_length_mm=20.0,
+    cross_section_area_mm2=400.0,
+    initial_height_mm=20.0,
+    material="PLA",
+    mass_g=4.0,
+)
+
+
+def test_strain_tag_is_a_clean_column_fragment():
+    assert strain_tag(0.1) == "10pct"
+    assert strain_tag(0.2) == "20pct"
+    assert strain_tag(0.05) == "5pct"
+    assert strain_tag(0.125) == "12.5pct"
+
+
+def test_fixed_strain_metrics_match_the_curve(clean_curve):
+    strain, stress, spec = clean_curve
+    out = fixed_strain_metrics(strain, stress, SPEC, DEFAULT_CONFIG)
+
+    # On the linear plateau, stress at 20% is analytic.
+    expected = spec.plateau_stress_MPa + spec.plateau_slope_MPa * (
+        0.20 - spec.softening_end_strain
+    )
+    assert out["stress_at_20pct_MPa"] == pytest.approx(expected, rel=1e-3)
+
+    mask = strain <= 0.20
+    energy = np.trapezoid(stress[mask], strain[mask])
+    assert out["energy_to_20pct_MJ_m3"] == pytest.approx(energy, rel=2e-3)
+
+    # SEA: W [MJ/m^3 = mJ/mm^3] * 8000 mm^3 / 1000 -> J, / 4 g.
+    assert out["sea_to_20pct_J_per_g"] == pytest.approx(
+        out["energy_to_20pct_MJ_m3"] * 8000 / 1000 / 4.0
+    )
+
+
+def test_fixed_strain_levels_not_reached_are_nan_not_extrapolated():
+    """A test cut off at 15% has no stress at 20% -- it was never measured."""
+    strain = np.linspace(0, 0.15, 500)
+    stress = foam_stress(strain, FoamCurveSpec())
+    out = fixed_strain_metrics(strain, stress, SPEC, DEFAULT_CONFIG)
+    assert np.isfinite(out["stress_at_10pct_MPa"])
+    assert np.isnan(out["stress_at_20pct_MPa"])
+    assert np.isnan(out["energy_to_20pct_MJ_m3"])
+
+
+def test_fixed_strain_sea_needs_a_mass(clean_curve):
+    strain, stress, _ = clean_curve
+    massless = Specimen(**{**SPEC.__dict__, "mass_g": None})
+    out = fixed_strain_metrics(strain, stress, massless, DEFAULT_CONFIG)
+    assert np.isnan(out["sea_to_20pct_J_per_g"])
+    assert np.isfinite(out["energy_to_20pct_MJ_m3"])
+
+
+def test_fixed_strain_levels_are_configurable(clean_curve):
+    strain, stress, _ = clean_curve
+    cfg = DEFAULT_CONFIG.replace(fixed_strain_levels=(0.05, 0.40))
+    out = fixed_strain_metrics(strain, stress, SPEC, cfg)
+    assert {"stress_at_5pct_MPa", "stress_at_40pct_MPa"} <= set(out)
+    assert "stress_at_20pct_MPa" not in out
+
+
+def test_energy_ignores_noise_reversals_after_the_crossing():
+    """A strain dip after crossing the limit must not be folded back in."""
+    from src.mechanics import energy_to_strain
+
+    strain = np.array([0.0, 0.1, 0.2, 0.3, 0.19, 0.4])
+    stress = np.array([0.0, 1.0, 1.0, 1.0, 50.0, 1.0])  # huge value on the dip
+    # Integral of the clean part up to 0.2: 0.5*0.1*1 + 0.1*1 = 0.15
+    assert energy_to_strain(strain, stress, 0.2) == pytest.approx(0.15)
+
+
+# --------------------------------------------------------- plateau coverage ----
+def test_plateau_window_coverage():
+    cfg = DEFAULT_CONFIG  # window 0.20-0.30
+    assert plateau_window_coverage(np.linspace(0, 0.60, 10), cfg) == pytest.approx(1.0)
+    assert plateau_window_coverage(np.linspace(0, 0.28, 10), cfg) == pytest.approx(0.8)
+    assert plateau_window_coverage(np.linspace(0, 0.15, 10), cfg) == pytest.approx(0.0)
+
+
+def test_plateau_not_reported_when_window_mostly_uncovered():
+    """Stopping at 28% would average only the low end of a 20-30% window."""
+    strain = np.linspace(0, 0.28, 2000)
+    stress = foam_stress(strain, FoamCurveSpec())
+    value, _, diags = plateau_stress(strain, stress, DEFAULT_CONFIG)
+    assert np.isnan(value)
+    assert any(d.code == "plateau_window_partial" and d.level == "warning" for d in diags)
+
+
+def test_plateau_reported_with_note_when_nearly_covered():
+    strain = np.linspace(0, 0.295, 2000)  # 95% coverage
+    stress = foam_stress(strain, FoamCurveSpec())
+    value, _, diags = plateau_stress(strain, stress, DEFAULT_CONFIG)
+    assert np.isfinite(value)
+    assert any(d.code == "plateau_window_partial" and d.level == "info" for d in diags)
+
+
+# ------------------------------------------------- densification end check ----
+def test_densification_near_the_end_counts_as_not_reached():
+    """A criterion still climbing at the cut-off gives a lower bound only."""
+    strain = np.linspace(0, 0.35, 1200)
+    stress = foam_stress(strain, FoamCurveSpec())
+    noisy = stress + np.random.default_rng(3).normal(0, 0.003, stress.size)
+    result, _ = densification_energy_efficiency(strain, noisy, DEFAULT_CONFIG)
+    assert result.at_end_of_data
+
+
+def test_noise_on_a_soft_specimen_does_not_fake_a_first_peak():
+    """A monotonic curve at ~240 N with 1.5 N noise must not report a peak.
+
+    Before smoothing, the noise produced 2.4-2.8% "drops" on 7 of 32 such
+    synthetic specimens, just over the 2% threshold.
+    """
+    spec = FoamCurveSpec(peak_stress_MPa=None, modulus_MPa=25.0, plateau_stress_MPa=0.6)
+    strain = np.linspace(0, 0.5, 2100)
+    clean = foam_stress(strain, spec)
+    hits = 0
+    for seed in range(20):
+        noisy = clean + np.random.default_rng(seed).normal(0, 1.5 / 400.0, strain.size)
+        result, _ = first_peak(strain, noisy, noisy * 400.0, 0.45, DEFAULT_CONFIG)
+        hits += result.has_distinct_first_peak
+    assert hits == 0, f"{hits} of 20 noisy monotonic curves reported a first peak"
+
+
+def test_real_buckling_peak_survives_smoothing_on_a_noisy_curve():
+    spec = FoamCurveSpec()  # 2.7 MPa peak softening to 2.15 MPa
+    strain = np.linspace(0, 0.5, 2100)
+    noisy = foam_stress(strain, spec) + np.random.default_rng(0).normal(0, 1.5 / 400.0, strain.size)
+    result, _ = first_peak(strain, noisy, noisy * 400.0, 0.45, DEFAULT_CONFIG)
+    assert result.has_distinct_first_peak
+    assert result.first_peak_stress_MPa == pytest.approx(2.70, rel=0.02)
+    assert result.first_peak_strain == pytest.approx(0.045, abs=0.004)

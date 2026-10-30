@@ -123,6 +123,9 @@ class SyntheticTest:
     #: Load-cell noise, one standard deviation in newtons.
     noise_N: float = 1.5
     seed: int = 0
+    #: Stop the test when force reaches this load, as a frame configured with
+    #: a load limit does (9.5 kN on the 10 kN frame). None runs to max_strain.
+    force_limit_N: float | None = None
 
     @property
     def area_mm2(self) -> float:
@@ -145,6 +148,15 @@ class SyntheticTest:
         force = force + rng.normal(0, self.noise_N, n)
         # Before contact the cell reads noise around zero, not the ramp.
         force = np.where(disp < self.slack_mm, rng.normal(0, self.noise_N, n), force)
+
+        if self.force_limit_N is not None:
+            hit = np.flatnonzero(force >= self.force_limit_N)
+            if hit.size:
+                # The frame stops on the first sample at the limit, which is
+                # logged at the limit -- exactly how the real exports end.
+                k = int(hit[0])
+                time, disp, force = time[: k + 1], disp[: k + 1], force[: k + 1].copy()
+                force[-1] = self.force_limit_N
 
         return time, disp, np.round(force / 1000.0, 4)
 
@@ -169,3 +181,114 @@ SAMPLE_FILENAME = "solid_compression_20260717_192209_1_1.csv"
 def sample_test() -> SyntheticTest:
     """The reference synthetic test matching the brief's example filename."""
     return SyntheticTest(name=SAMPLE_FILENAME, seed=20260717)
+
+
+# ----------------------------------------------------------------------
+# A planted design space: known causes, for demos and for testing the
+# correlation analysis against ground truth.
+# ----------------------------------------------------------------------
+#: Levels each factor is drawn from.
+PLANTED_LEVELS: dict[str, tuple] = {
+    "cell_mm": (4.0, 5.0, 6.0, 7.0, 8.0),
+    "wall_mm": (0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2),
+    "topology": ("gyroid", "honeycomb"),
+    "layer_height_mm": (0.12, 0.20, 0.28),
+    "print_speed_mm_s": (40.0, 60.0, 80.0),
+    "nozzle_temp_C": (200.0, 210.0, 220.0),
+}
+
+#: The ground truth `planted_design` builds in. Anything not listed here has
+#: no effect at all -- print speed and nozzle temperature are pure nulls.
+PLANTED_TRUTH = """\
+relative density  rho* = k_topology * wall / cell * (1 + 3% noise)
+                  k = 1.25 gyroid, 1.6 honeycomb
+modulus           E = 2500 MPa * rho*^2 * f_topology * f_layer      (bending, n = 2)
+plateau stress    sigma = 18 MPa * rho*^1.5 * f_topology * f_layer (bending, n = 1.5)
+topology          f = 1.0 gyroid, 1.3 honeycomb; honeycomb also buckles (first
+                  peak 1.25 x plateau), gyroid does not
+layer height      f = 1 - 1.2 * (layer_height_mm - 0.20): about +/-10 percent --
+                  small next to the ~30x spread from density, so it is MASKED
+                  pairwise and only shows once density is held fixed
+densification     strain = 0.75 - rho*, clipped to 0.30-0.55
+print speed       no effect
+nozzle temp       no effect
+"""
+
+
+def planted_design(n: int = 64, seed: int = 7) -> pd.DataFrame:
+    """Draw `n` distinct patterns with known parameter -> property causes.
+
+    Cell size, wall thickness and topology form the pattern (every one
+    distinct, like a real design sweep); the manufacturing settings are drawn
+    independently per test. Returns one row per test with the parameters and
+    the *true* properties (before any measurement), per PLANTED_TRUTH.
+    """
+    import pandas as pd
+
+    rng = np.random.default_rng(seed)
+    combos = [
+        (c, w, t)
+        for c in PLANTED_LEVELS["cell_mm"]
+        for w in PLANTED_LEVELS["wall_mm"]
+        for t in PLANTED_LEVELS["topology"]
+    ]
+    if n > len(combos):
+        raise ValueError(f"at most {len(combos)} distinct patterns available")
+    picks = rng.choice(len(combos), size=n, replace=False)
+
+    rows = []
+    for i, pick in enumerate(picks):
+        cell, wall, topology = combos[pick]
+        layer = float(rng.choice(PLANTED_LEVELS["layer_height_mm"]))
+        speed = float(rng.choice(PLANTED_LEVELS["print_speed_mm_s"]))
+        temp = float(rng.choice(PLANTED_LEVELS["nozzle_temp_C"]))
+
+        k = 1.25 if topology == "gyroid" else 1.6
+        rho = float(np.clip(k * wall / cell * (1 + rng.normal(0, 0.03)), 0.05, 0.6))
+        f_top = 1.0 if topology == "gyroid" else 1.3
+        f_layer = 1.0 - 1.2 * (layer - 0.20)
+        modulus = 2500.0 * rho**2 * f_top * f_layer * float(rng.lognormal(0, 0.05))
+        plateau = 18.0 * rho**1.5 * f_top * f_layer * float(rng.lognormal(0, 0.05))
+
+        rows.append(
+            {
+                "test_id": f"doe_{i + 1:02d}",
+                "pattern_name": f"{topology}_c{cell:g}_w{wall:g}",
+                "topology": topology,
+                "cell_mm": cell,
+                "wall_mm": wall,
+                "layer_height_mm": layer,
+                "print_speed_mm_s": speed,
+                "nozzle_temp_C": temp,
+                "relative_density": round(rho, 4),
+                "material": "PLA",
+                # Solid PLA ~1.24 g/cm^3 over a 20 mm cube (8 cm^3).
+                "mass_g": round(1.24 * 8.0 * rho, 3),
+                "true_modulus_MPa": modulus,
+                "true_plateau_MPa": plateau,
+                "true_peak_MPa": 1.25 * plateau if topology == "honeycomb" else np.nan,
+                "true_densification_strain": float(np.clip(0.75 - rho, 0.30, 0.55)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def planted_curve_spec(row) -> FoamCurveSpec:
+    """The synthetic compression curve for one `planted_design` row."""
+    modulus = float(row["true_modulus_MPa"])
+    plateau = float(row["true_plateau_MPa"])
+    peak = row["true_peak_MPa"]
+    has_peak = peak == peak  # not NaN
+    peak_strain = float(peak) / modulus if has_peak else plateau / modulus
+    return FoamCurveSpec(
+        modulus_MPa=modulus,
+        peak_strain=peak_strain,
+        peak_stress_MPa=float(peak) if has_peak else None,
+        plateau_stress_MPa=plateau,
+        plateau_slope_MPa=0.4 * plateau,
+        softening_end_strain=peak_strain + 0.04,
+        densification_strain=float(row["true_densification_strain"]),
+        densification_rise_MPa=6.0 * plateau,
+        densification_exponent=2.2,
+        densification_span=0.2,
+    )

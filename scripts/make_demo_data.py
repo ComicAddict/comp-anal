@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""Generate a synthetic demo design space, so the pipeline can be run today.
+"""Generate a synthetic 64-test design space, so the pipeline can be run today.
 
-    python scripts/make_demo_data.py            # writes demo/
-    python scripts/run_analysis.py --root demo  # analyse it
-    open demo/results/figures/*.png
+    python scripts/make_demo_data.py              # writes demo/
+    python scripts/run_analysis.py --root demo    # analyse it (+ correlation)
+    python scripts/run_analysis.py --root demo --force --color-by relative_density
 
-Everything this writes is SYNTHETIC -- five made-up patterns with three
-replicates each, in the instrument's export format. It exists to show the
-pipeline working end to end and to give the figures something to plot before
-real tests are registered. Nothing here is measured data; delete `demo/` once
-your own tests are in `data/raw/`.
+Everything this writes is SYNTHETIC: 64 distinct patterns (cell size x wall
+thickness x topology) each printed with its own layer height, print speed and
+nozzle temperature, in the instrument's export format and stopped at the same
+9.5 kN load limit as the real frame. Nothing here is measured data; delete
+`demo/` once your own tests are in `data/raw/`.
+
+Because the causes are planted, the demo doubles as a check on the
+correlation analysis -- this is what it should find:
+
+{truth}
+Parameters are written as extra specimens.csv columns, one per parameter --
+the layout recommended for a real spreadsheet.
 """
 
 from __future__ import annotations
@@ -23,128 +30,72 @@ import shutil
 from pathlib import Path
 
 from src.specimens import COLUMNS
-from src.synthetic import FoamCurveSpec, SyntheticTest
+from src.synthetic import PLANTED_TRUTH, SyntheticTest, planted_curve_spec, planted_design
 
-#: A small design space: a solid baseline plus four cut-out patterns, two of
-#: them a parameter sweep over cell size so the metric-vs-parameter view has
-#: something to show.
-PATTERNS: dict[str, dict] = {
-    "solid": {
-        "params": {"kind": "baseline"},
-        "relative_density": 1.00,
-        "mass_g": 9.9,
-        "curve": {},
-    },
-    "gyroid_v2": {
-        "params": {"cell_mm": 5.0, "wall_mm": 0.8},
-        "relative_density": 0.32,
-        "mass_g": 3.2,
-        "curve": {
-            "modulus_MPa": 24.0,
-            "peak_stress_MPa": None,
-            "plateau_stress_MPa": 1.05,
-            "plateau_slope_MPa": 0.55,
-            "densification_strain": 0.50,
-            "densification_rise_MPa": 9.0,
-        },
-    },
-    "gyroid_v2_coarse": {
-        "params": {"cell_mm": 8.0, "wall_mm": 0.8},
-        "relative_density": 0.24,
-        "mass_g": 2.4,
-        "curve": {
-            "modulus_MPa": 14.0,
-            "peak_stress_MPa": None,
-            "plateau_stress_MPa": 0.62,
-            "plateau_slope_MPa": 0.35,
-            "densification_strain": 0.55,
-            "densification_rise_MPa": 7.5,
-        },
-    },
-    "honeycomb_neg_A": {
-        "params": {"cell_mm": 6.0, "wall_mm": 1.0},
-        "relative_density": 0.38,
-        "mass_g": 3.8,
-        "curve": {
-            "modulus_MPa": 78.0,
-            "peak_strain": 0.030,
-            "peak_stress_MPa": 2.34,
-            "plateau_stress_MPa": 1.55,
-            "softening_end_strain": 0.075,
-            "densification_strain": 0.44,
-            "densification_rise_MPa": 11.0,
-        },
-    },
-    "auxetic_reentrant": {
-        "params": {"cell_mm": 6.0, "wall_mm": 0.9, "angle_deg": 70},
-        "relative_density": 0.29,
-        "mass_g": 2.9,
-        "curve": {
-            "modulus_MPa": 41.0,
-            "peak_strain": 0.055,
-            "peak_stress_MPa": 2.26,
-            "plateau_stress_MPa": 1.35,
-            "plateau_slope_MPa": 1.3,
-            "densification_strain": 0.40,
-            "densification_rise_MPa": 13.0,
-        },
-    },
-}
+__doc__ = __doc__.format(truth=PLANTED_TRUTH)
+
+PARAMETER_COLUMNS = (
+    "cell_mm",
+    "wall_mm",
+    "topology",
+    "layer_height_mm",
+    "print_speed_mm_s",
+    "nozzle_temp_C",
+)
 
 
-def build(root: Path, replicates: int = 3, clean: bool = False) -> Path:
-    raw_dir = root / "data" / "raw"
+def build(
+    root: Path,
+    n_tests: int = 64,
+    seed: int = 7,
+    force_limit_kN: float | None = 9.5,
+    clean: bool = False,
+) -> Path:
     if clean and root.exists():
         shutil.rmtree(root)
+    raw_dir = root / "data" / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
+    design = planted_design(n_tests, seed)
     rows: list[dict] = []
-    for p_index, (pattern, config) in enumerate(PATTERNS.items()):
-        for rep in range(1, replicates + 1):
-            name = f"{pattern}_compression_2026071{p_index}_1{rep:02d}500_1_{rep}.csv"
-            # Replicates differ slightly, as real repeats of one pattern do.
-            jitter = 1.0 + 0.04 * (rep - (replicates + 1) / 2)
-            curve = dict(config["curve"])
-            for key in ("modulus_MPa", "plateau_stress_MPa", "peak_stress_MPa"):
-                if curve.get(key):
-                    curve[key] = round(curve[key] * jitter, 4)
-            if "modulus_MPa" not in curve:
-                curve["modulus_MPa"] = round(60.0 * jitter, 4)
-                curve["peak_stress_MPa"] = round(2.70 * jitter, 4)
-                curve["plateau_stress_MPa"] = round(2.15 * jitter, 4)
+    for i, row in design.iterrows():
+        name = f"{row['pattern_name']}_compression_20260801_{i:06d}_1_1.csv"
+        SyntheticTest(
+            name=name,
+            curve=planted_curve_spec(row),
+            seed=1000 + i,
+            slack_mm=0.10 + 0.05 * (i % 5),
+            max_strain=0.65,
+            force_limit_N=force_limit_kN * 1000.0 if force_limit_kN else None,
+        ).write(raw_dir / name)
 
-            test = SyntheticTest(
-                name=name,
-                curve=FoamCurveSpec(**curve),
-                seed=100 * p_index + rep,
-                slack_mm=0.40 + 0.05 * rep,
-            )
-            test.write(raw_dir / name)
-
-            rows.append(
-                {
-                    "test_id": Path(name).stem,
-                    "raw_file": name,
-                    "pattern_name": pattern,
-                    "pattern_params": json.dumps(config["params"], sort_keys=True),
-                    "replicate": rep,
-                    "side_length_mm": test.side_length_mm,
-                    "cross_section_area_mm2": "",
-                    "initial_height_mm": test.initial_height_mm,
-                    "relative_density": config["relative_density"],
-                    "mass_g": round(config["mass_g"] * jitter, 2),
-                    "material": "PLA",
-                    "test_date": f"2026-07-1{p_index}",
-                    "notes": "SYNTHETIC demo data -- not a real measurement",
-                }
-            )
+        record = {
+            "test_id": Path(name).stem,
+            "raw_file": name,
+            "pattern_name": row["pattern_name"],
+            "pattern_params": "{}",
+            "replicate": 1,
+            "side_length_mm": 20.0,
+            "cross_section_area_mm2": "",
+            "initial_height_mm": 20.0,
+            "relative_density": row["relative_density"],
+            "mass_g": row["mass_g"],
+            "material": row["material"],
+            "test_date": "2026-08-01",
+            "notes": "SYNTHETIC demo data -- not a real measurement",
+        }
+        record.update({column: row[column] for column in PARAMETER_COLUMNS})
+        rows.append(record)
 
     specimens = root / "data" / "specimens.csv"
     with specimens.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(COLUMNS))
+        writer = csv.DictWriter(handle, fieldnames=list(COLUMNS) + list(PARAMETER_COLUMNS))
         writer.writeheader()
         writer.writerows(rows)
 
+    # Same machine setup as the real project, so truncation is flagged.
+    config = {"force_limit_kN": force_limit_kN} if force_limit_kN else {}
+    (root / "analysis_config.json").write_text(json.dumps(config, indent=2) + "\n")
     return specimens
 
 
@@ -153,16 +104,23 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--root", type=Path, default=Path("demo"), help="output directory")
-    parser.add_argument("--replicates", type=int, default=3)
+    parser.add_argument("--tests", type=int, default=64, help="number of distinct patterns (max 70)")
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--force-limit-kN", type=float, default=9.5,
+                        help="load limit the synthetic frame stops at; 0 for none")
     parser.add_argument("--clean", action="store_true", help="delete --root first")
     args = parser.parse_args(argv)
 
-    specimens = build(args.root, args.replicates, args.clean)
+    specimens = build(
+        args.root, args.tests, args.seed,
+        args.force_limit_kN if args.force_limit_kN > 0 else None, args.clean,
+    )
     count = len(list((args.root / "data" / "raw").glob("*.csv")))
     print(
-        f"Wrote {count} synthetic test(s) across {len(PATTERNS)} pattern(s).\n"
+        f"Wrote {count} synthetic test(s), one pattern each.\n"
         f"  raw       -> {args.root / 'data' / 'raw'}/\n"
-        f"  specimens -> {specimens}\n\n"
+        f"  specimens -> {specimens}  (parameters as extra columns)\n\n"
+        f"Planted truth -- what the correlation analysis should recover:\n{PLANTED_TRUTH}\n"
         f"Next: python scripts/run_analysis.py --root {args.root}"
     )
     return 0

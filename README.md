@@ -531,6 +531,24 @@ Stress, energy efficiency and the densification gauge r for every test, with
 the verdict in the subtitle — see *Onset of densification*. Above 8 tests the
 curves go to one colour, as in the overlay.
 
+### (d) Pattern classes: `class_space.png` and `class_comparison.png`
+With `class_by` set (`analysis_config.json` has `["tpms_type", "family"]`), each
+test is labelled by the first of those columns it has a value for: TPMS
+specimens by their type (gyroid, schwarz_p, …), plain ones by their family. The
+classes being compared get the categorical colours; a class that only comes
+from a later column (plain) is a grey reference group drawn behind them.
+
+- `class_space.png` — small multiples of property pairs (E vs plateau σ, σ at
+  10% vs 20%, plateau σ vs W to 20%, E vs W to 20%, mass vs plateau σ), every
+  test a point, each class's median outlined. Shows which classes occupy which
+  part of property space, and whether a class is stiff-but-weak or the reverse.
+- `class_comparison.png` — one row per class for each property, dots for tests,
+  median and middle 50% marked, rows sorted by modulus. The direct ranking.
+- `results/class_summary.csv` — n, median and quartiles per class and property.
+
+Whether the differences between classes are significant is in the correlation
+summary (`tpms_type` and `family` as categorical factors).
+
 **Chart conventions.** One marker shape throughout. Categorical colour comes
 from a fixed, colourblind-validated order and is used only when there are few
 enough levels to tell apart; continuous colour is a one-hue blue ramp; text is
@@ -691,7 +709,7 @@ tests toe compensation leaves E unchanged and moves the stresses by about 1%
 ## Tests
 
 ```bash
-python -m pytest tests/ -q       # 238 tests
+python -m pytest tests/ -q       # 243 tests
 ```
 
 Coverage is aimed at the two things most likely to go quietly wrong: parsing
@@ -736,6 +754,7 @@ src/
   pipeline.py              orchestration and change detection
   synthetic.py             instrument-format generation for tests and the demo
   metadata_import.py       metadata sheets -> specimens rows
+  classes.py               property space and comparison by pattern class
 analysis_config.json       machine setup (load limit), per-series split; loaded automatically
 metadata_sources.json      how to read each metadata sheet into specimens.csv
 scripts/

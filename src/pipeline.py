@@ -482,6 +482,14 @@ def make_figures(
         if out is not None:
             written.append(out)
 
+    # Property space and property-by-property comparison by pattern class.
+    from .classes import make_class_outputs
+
+    written += [
+        out for out in make_class_outputs(metrics, paths.figures_dir, paths.results_dir, cfg)
+        if out.suffix == ".png"
+    ]
+
     # (b) Metric-space scatter with achievable-property hull.
     for x, y in pairs:
         if x not in metrics.columns or y not in metrics.columns:

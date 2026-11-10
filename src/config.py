@@ -223,6 +223,11 @@ class AnalysisConfig:
     #: with different design parameters -- plain codes vs TPMS type and scale --
     #: are then each analysed on their own terms, besides the pooled run.
     correlation_split_by: str | None = None
+    #: Columns that name a test's pattern class, tried in order: the first
+    #: non-blank one labels the test. ["tpms_type", "family"] labels TPMS
+    #: specimens by type and the rest by family. Drives class_space.png,
+    #: class_comparison.png and class_summary.csv; empty to skip them.
+    class_by: tuple[str, ...] = ()
 
     # ------------------------------------------------------------------
 

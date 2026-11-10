@@ -1242,9 +1242,10 @@ def summarise(result: CorrelationResult, max_rows: int = 15) -> str:
     if any("isolated" in line for line in lines):
         lines.append(
             f"\n  * isolated: significant for one property only. At FDR {result.alpha:g}, about "
-            f"{result.alpha:.0%} of all discoveries are expected to be false, and a real\n"
-            f"    effect usually shows across related properties (strength, energy, modulus) -- "
-            f"treat these as leads to re-test, not findings."
+            f"{result.alpha:.0%} of all discoveries\n"
+            f"    are expected to be false, and a real effect usually shows across related "
+            f"properties\n    (strength, energy, modulus) -- treat these as leads to re-test, "
+            f"not findings."
         )
 
     pairs = _collinear_pairs(result)

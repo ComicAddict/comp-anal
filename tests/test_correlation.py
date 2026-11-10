@@ -483,3 +483,20 @@ def test_association_measures():
     assert correlation_ratio(np.r_[np.arange(20), np.arange(100, 120)], groups) > 0.85
     rng = np.random.default_rng(7)
     assert cramers_v(groups, rng.choice(["x", "y"], 40)) < 0.4
+
+
+# ------------------------------------------------------ per-group runs ----
+def test_split_by_runs_the_analysis_within_each_level(planted, tmp_path):
+    from src.pipeline import PipelinePaths, PipelineResult, run_group_correlations
+
+    paths = PipelinePaths.from_root(tmp_path)
+    run = PipelineResult(metrics=planted, diagnostics=pd.DataFrame())
+    cfg = DEFAULT_CONFIG.replace(correlation_split_by="topology")
+    run_group_correlations(paths, run, cfg, figures=False)
+
+    assert set(run.group_correlations) == {"topology=gyroid", "topology=honeycomb"}
+    gyroid = run.group_correlations["topology=gyroid"]
+    assert gyroid.n_tests == int((planted["param_topology"] == "gyroid").sum())
+    assert (paths.correlation_dir / "by_topology-gyroid" / "summary.txt").exists()
+    # Within one level the factor is constant, so it is not tested there.
+    assert not {p.name: p for p in gyroid.parameters}["topology"].included

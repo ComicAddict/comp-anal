@@ -6,6 +6,10 @@
     python scripts/run_analysis.py --force         # ignore the change detector
     python scripts/run_analysis.py --watch         # re-run whenever inputs change
 
+With a metadata_sources.json at the root, specimens.csv is first rebuilt from
+the metadata sheets it names (scripts/import_metadata.py), so editing a sheet
+or dropping new raw exports in is all a re-run needs. --no-import skips that.
+
 Outputs land in results/:
     metrics_summary.csv   one row per test, joined with its pattern metadata
     diagnostics.csv       every warning raised while parsing and analysing
@@ -60,6 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--color-by",
         metavar="PARAMETER",
         help="colour curves and points by a parameter (e.g. relative_density, cell_mm)",
+    )
+    parser.add_argument(
+        "--no-import",
+        action="store_true",
+        help="use data/specimens.csv as it is, without rebuilding it from metadata_sources.json",
     )
     parser.add_argument(
         "--no-correlation",
@@ -189,8 +198,12 @@ def summarise(result, paths: PipelinePaths) -> None:
         from src.correlation import summarise as correlation_summary
 
         print("\n" + correlation_summary(result.correlation))
+        for group, group_result in result.group_correlations.items():
+            print(f"\n=== Within {group} ===\n" + correlation_summary(group_result))
         print(f"\n  tables  -> {paths.correlation_dir}/")
         print(f"  figures -> {paths.correlation_figures_dir}/")
+        if result.group_correlations:
+            print("  (one by_<parameter>-<level>/ subfolder per group)")
     elif not result.skipped:
         explain_no_correlation(metrics, paths)
 
@@ -252,7 +265,43 @@ def explain_no_correlation(metrics: pd.DataFrame, paths: PipelinePaths) -> None:
     )
 
 
+def import_metadata(paths: PipelinePaths, verbose: bool = True) -> bool:
+    """Rebuild specimens.csv from metadata_sources.json; False on a problem.
+
+    The file is only rewritten when its content changes, so an unchanged
+    import does not trigger a re-analysis.
+    """
+    from src.metadata_import import CONFIG_FILENAME, build_specimens
+    from src.specimens import read_specimens_frame, validate_frame
+
+    config = paths.root / CONFIG_FILENAME
+    if not config.exists():
+        return True
+    try:
+        existing = read_specimens_frame(paths.specimens_csv) if paths.specimens_csv.exists() else None
+        frame, reports, _ = build_specimens(config, paths.root, existing)
+        if frame.empty:
+            return True
+        validate_frame(frame.copy(), paths.raw_dir)
+    except SpecimenError as exc:
+        print(f"\nmetadata import problem ({CONFIG_FILENAME}):\n{exc}", file=sys.stderr)
+        return False
+    text = frame.to_csv(index=False)
+    old = paths.specimens_csv.read_text() if paths.specimens_csv.exists() else None
+    if text != old:
+        paths.specimens_csv.write_text(text)
+    if verbose:
+        imported = sum(r.imported for r in reports)
+        missing = sum(len(r.no_raw_file) for r in reports)
+        print(f"Imported {imported} test(s) from {CONFIG_FILENAME}"
+              + (f"; {missing} sheet row(s) have no raw file yet" if missing else "")
+              + " (details: python scripts/import_metadata.py --check)")
+    return True
+
+
 def run_once(paths: PipelinePaths, args: argparse.Namespace, cfg: AnalysisConfig) -> int:
+    if not args.no_import and not import_metadata(paths, verbose=not getattr(args, "_quiet_import", False)):
+        return 2
     try:
         result = run_pipeline(
             paths,
@@ -278,6 +327,8 @@ def main(argv: list[str] | None = None) -> int:
     paths = PipelinePaths.from_root(args.root)
     cfg = resolve_config(args)
 
+    if not args.no_import:
+        import_metadata(paths, verbose=False)
     if not paths.specimens_csv.exists():
         print(
             f"error: {paths.specimens_csv} not found.\n"
@@ -293,10 +344,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nWatching {paths.raw_dir} and {paths.specimens_csv} "
           f"(every {args.interval:g}s). Ctrl-C to stop.")
     args.force = False
+    args._quiet_import = True
     last = input_fingerprint(paths, cfg)
     try:
         while True:
             time.sleep(args.interval)
+            if not args.no_import:
+                import_metadata(paths, verbose=False)   # picks up sheet edits
             current = input_fingerprint(paths, cfg)
             if current != last or is_stale(paths, cfg):
                 print(f"\n--- change detected at {time.strftime('%H:%M:%S')} ---")

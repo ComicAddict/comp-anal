@@ -27,7 +27,12 @@ python -m pip install -r requirements.txt
 # 0. Check what a new export actually contains (no metadata needed).
 python scripts/inspect_raw.py --duplicates
 
-# 1. Drop instrument CSVs into data/raw/, then register each one once.
+# 1. Drop instrument CSVs into data/raw/<series>/ and keep your metadata sheets
+#    in data/metadata/. metadata_sources.json says how to read them; run_analysis
+#    rebuilds specimens.csv from them automatically (see "From your metadata sheets").
+python scripts/import_metadata.py --check       # what matched, what is missing
+
+#    Or register tests by hand:
 python scripts/register_test.py --list          # what still needs registering
 python scripts/register_test.py --template      # skeleton specimens.csv to fill in
 python scripts/register_test.py --interactive   # or be prompted field by field
@@ -196,6 +201,64 @@ you have it (`register_test.py` adds the column the first time it is given one)
 — and the ticked ones must also be **non-null**. Validation runs before any
 analysis, and reports every problem at once with row numbers — it does not fail
 on the first one. A test dated before its print is one of those problems.
+
+### From your metadata sheets (the automatic route)
+
+`specimens.csv` does not have to be typed. Keep one metadata sheet per test
+series, in whatever layout the lab already uses, and describe it once in
+`metadata_sources.json`. `run_analysis.py` then rebuilds `specimens.csv` from the
+sheets on every run, so adding tests means adding sheet rows and dropping raw
+exports in — nothing else. `scripts/import_metadata.py --check` shows what it did.
+
+Set up now for the two series:
+
+| series | sheet | raw exports | what comes from it |
+|---|---|---|---|
+| `plain` | `data/metadata/plain_metadata.csv` | `data/raw/plain/` | pattern code split into `code_1`–`code_3` (one per digit), test date, batch, bed x/y |
+| `tpms` | `data/metadata/baseline_metadata.csv` | `data/raw/baseline/` | TPMS type, scale, slicer mass, print and test time, bed x/y |
+
+How a sheet is read:
+
+- **Raw files are matched by test number**: the first number group in
+  `..._<test no>_<export>.csv`. Each series has its own folder because both
+  number their tests from 1. A test exported twice uses the first export; the
+  others are listed.
+- **Columns map by name.** Common names are recognised (`testing date` →
+  `test_date`, `manufacturing date` → `print_date`, `weight` → `mass_g`,
+  `manufacturing group` → `print_batch`, `discrepancy` → `notes`), anything
+  else becomes a parameter under its own name — so a column added to a sheet
+  later is analysed without touching the config. `"columns"` overrides a
+  mapping; `null` drops a column. Two columns landing on one field is an error
+  that says which to change.
+- **Dates are rewritten in ISO form**, read month-first (`8-6-26` is 6 August
+  2026) unless `date_order` is `DMY`.
+- **Geometry and material** come from `defaults` (16 mm PLA, relative density
+  0.8). With a measured weight, relative density is computed per specimen from
+  it and `bulk_density_g_cm3` (1.24 for PLA) — so weighing pays off twice: SEA
+  per gram, and density as a measured parameter instead of a nominal one.
+- **Derived**: `bed_r`, the distance from the bed centre, from `bed_x`/`bed_y`;
+  batch numbers become labels (`B1`), since batch 3 is not "more" than batch 2.
+- **Exclusions**: rows whose `discrepancy` mentions `retest` are left out and
+  listed (plain test 57 now). Rows marked "could be pattern …" are kept, with
+  the note carried into `notes`.
+- **Hand-registered rows survive**: a row whose `test_id` does not start with a
+  series name (`plain_`, `tpms_`) is kept as it is.
+
+`analysis_config.json` sets `"correlation_split_by": "family"`, so the
+correlation runs on all tests together and again within each series, into
+`results/correlation/by_family-plain/` and `by_family-tpms/`. The series have
+different design parameters, and each is best read on its own terms.
+
+**Two things the analysis will report about these sheets as they stand**, both
+from the metadata alone:
+
+- *Plain: batch is fixed by the pattern code.* Batch 3 holds every `0xx`
+  pattern, batch 2 every `1xx` and half the `2xx`, batch 1 the rest. A batch
+  effect and a first-digit effect cannot be told apart in this data; they
+  will be reported as confounded.
+- *TPMS: each type was printed in its own 3 × 3 patch of the bed.* Bed position
+  and TPMS type are therefore the same thing to the analysis (η = 0.94). A
+  future print that scatters each type over the bed would separate them.
 
 ### Design and manufacturing parameters: just add columns
 
@@ -628,7 +691,7 @@ tests toe compensation leaves E unchanged and moves the stresses by about 1%
 ## Tests
 
 ```bash
-python -m pytest tests/ -q       # 226 tests
+python -m pytest tests/ -q       # 237 tests
 ```
 
 Coverage is aimed at the two things most likely to go quietly wrong: parsing
@@ -652,7 +715,8 @@ with analytically known properties.
 ```
 data/
   raw/                     untouched instrument CSVs
-  specimens.csv            metadata, single source of truth (you maintain this)
+  metadata/                the lab's own metadata sheets, one per test series
+  specimens.csv            metadata, single source of truth (rebuilt from metadata/)
   specimens.example.csv    filled-in example of the schema
 results/                   all generated
   metrics_summary.csv      one row per test — the main deliverable
@@ -671,10 +735,13 @@ src/
   correlation.py           parameter-property statistics and figures
   pipeline.py              orchestration and change detection
   synthetic.py             instrument-format generation for tests and the demo
-analysis_config.json       machine setup (load limit); loaded automatically
+  metadata_import.py       metadata sheets -> specimens rows
+analysis_config.json       machine setup (load limit), per-series split; loaded automatically
+metadata_sources.json      how to read each metadata sheet into specimens.csv
 scripts/
   inspect_raw.py           report what a raw file contains, before registering
-  register_test.py         onboard a raw CSV into specimens.csv
+  import_metadata.py       rebuild specimens.csv from the metadata sheets
+  register_test.py         onboard a raw CSV into specimens.csv by hand
   correlate.py             parameter-property correlation, sliced as needed
   run_analysis.py          raw -> metrics_summary.csv (+ figures)
   plot_envelope.py         figures from an existing metrics summary

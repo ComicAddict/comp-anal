@@ -1,0 +1,52 @@
+{
+  "_comment": "How to read each metadata sheet into data/specimens.csv. Run: python scripts/import_metadata.py. Columns not listed under 'columns' are recognised by name (testing date -> test_date, weight -> mass_g, ...) or become parameters under their own name; map a column to null to drop it. Dates are read month-first (MDY) unless date_order says DMY.",
+
+  "date_order": "MDY",
+  "defaults": {
+    "side_length_mm": 16,
+    "initial_height_mm": 16,
+    "material": "PLA",
+    "relative_density": 0.8
+  },
+  "_bulk_density_comment": "Solid PLA density. With a measured mass column (weight / mass_g), relative density is computed per specimen from it instead of the 0.8 default.",
+  "bulk_density_g_cm3": 1.24,
+
+  "sources": [
+    {
+      "name": "plain",
+      "metadata": "data/metadata/plain_metadata.csv",
+      "raw_dir": "plain",
+      "_raw_comment": "Raw exports in data/raw/plain/. The first number group in '..._<test no>_<export>.csv' is matched to 'test no'.",
+      "raw_file_regex": "_(\\d+)_(\\d+)\\.csv$",
+      "test_number_column": "test no",
+      "constant": { "family": "plain" },
+      "columns": {
+        "pattern": "pattern_name",
+        "date": "test_date",
+        "manufacturing group": "print_batch",
+        "manufacturing date": "print_date",
+        "discrepancy": "notes"
+      },
+      "_split_comment": "Pattern code 'abc' -> one numeric parameter per digit. Rename these to what the digits mean.",
+      "split_digits": { "pattern": ["code_1", "code_2", "code_3"] },
+      "exclude_where": { "discrepancy": "retest" }
+    },
+    {
+      "name": "tpms",
+      "metadata": "data/metadata/baseline_metadata.csv",
+      "raw_dir": "baseline",
+      "raw_file_regex": "_(\\d+)_(\\d+)\\.csv$",
+      "test_number_column": "test no",
+      "constant": { "family": "tpms" },
+      "columns": {
+        "specimen_name": "pattern_name",
+        "pattern name": "tpms_type",
+        "class_abb": null,
+        "scale": "scale",
+        "slicer grams": "slicer_mass_g",
+        "manufactured time": "print_date",
+        "test time": "test_date"
+      }
+    }
+  ]
+}

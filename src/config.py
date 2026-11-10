@@ -218,6 +218,11 @@ class AnalysisConfig:
     #: limit before densifying). Off by default: correlating a bound against a
     #: parameter mostly measures where each test happened to stop.
     correlation_include_censored: bool = False
+    #: Also run the correlation separately within each level of this parameter
+    #: (e.g. "family"), into results/correlation/by_<parameter>-<level>/. Series
+    #: with different design parameters -- plain codes vs TPMS type and scale --
+    #: are then each analysed on their own terms, besides the pooled run.
+    correlation_split_by: str | None = None
 
     # ------------------------------------------------------------------
 

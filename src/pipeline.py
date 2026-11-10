@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -117,6 +119,8 @@ class PipelineResult:
     skipped: bool = False
     correlation: Any = None          # CorrelationResult, when parameters vary
     correlation_files: list[Path] = field(default_factory=list)
+    #: "<parameter>=<level>" -> CorrelationResult, from correlation_split_by.
+    group_correlations: dict[str, Any] = field(default_factory=dict)
 
 
 # ----------------------------------------------------------------------
@@ -548,6 +552,11 @@ def run_correlation(
     from . import correlation
 
     correlation.clear_outputs(paths.correlation_dir, paths.correlation_figures_dir)
+    for directory in (paths.correlation_dir, paths.correlation_figures_dir):
+        if directory.exists():
+            for stale in directory.glob("by_*"):
+                if stale.is_dir():
+                    shutil.rmtree(stale)
     if not correlation.has_parameters(result.metrics, cfg):
         return
     result.correlation = correlation.analyse(result.metrics, cfg)
@@ -555,3 +564,34 @@ def run_correlation(
         result.correlation, paths.correlation_dir, paths.correlation_figures_dir,
         cfg, figures=figures,
     )
+    run_group_correlations(paths, result, cfg, figures=figures)
+
+
+def run_group_correlations(
+    paths: PipelinePaths,
+    result: PipelineResult,
+    cfg: AnalysisConfig = DEFAULT_CONFIG,
+    figures: bool = True,
+) -> None:
+    """One correlation run per level of `cfg.correlation_split_by`."""
+    from . import correlation
+    from .envelope import display_name, resolve_column
+
+    if not cfg.correlation_split_by:
+        return
+    column = resolve_column(result.metrics, cfg.correlation_split_by)
+    if column is None:
+        return
+    name = display_name(column)
+    values = result.metrics[column].astype(str).str.strip()
+    for level in sorted(v for v in values.unique() if v and v.lower() != "nan"):
+        subset = result.metrics[values == level].reset_index(drop=True)
+        if len(subset) < cfg.correlation_min_n or not correlation.has_parameters(subset, cfg):
+            continue
+        tag = re.sub(r"[^0-9A-Za-z_.-]+", "_", f"by_{name}-{level}")
+        group = correlation.analyse(subset, cfg)
+        result.group_correlations[f"{name}={level}"] = group
+        result.correlation_files += correlation.write_outputs(
+            group, paths.correlation_dir / tag, paths.correlation_figures_dir / tag,
+            cfg, figures=figures,
+        )

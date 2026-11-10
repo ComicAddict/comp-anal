@@ -691,7 +691,7 @@ tests toe compensation leaves E unchanged and moves the stresses by about 1%
 ## Tests
 
 ```bash
-python -m pytest tests/ -q       # 237 tests
+python -m pytest tests/ -q       # 238 tests
 ```
 
 Coverage is aimed at the two things most likely to go quietly wrong: parsing

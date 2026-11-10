@@ -500,3 +500,16 @@ def test_split_by_runs_the_analysis_within_each_level(planted, tmp_path):
     assert (paths.correlation_dir / "by_topology-gyroid" / "summary.txt").exists()
     # Within one level the factor is constant, so it is not tested there.
     assert not {p.name: p for p in gyroid.parameters}["topology"].included
+
+
+def test_split_by_skips_tests_with_no_group(planted, tmp_path):
+    """Hand-registered tests outside every series have no level; not an error."""
+    from src.pipeline import PipelinePaths, PipelineResult, run_group_correlations
+
+    metrics = planted.copy()
+    metrics.loc[metrics.index[:5], "param_topology"] = np.nan
+    run = PipelineResult(metrics=metrics, diagnostics=pd.DataFrame())
+    cfg = DEFAULT_CONFIG.replace(correlation_split_by="topology")
+    run_group_correlations(PipelinePaths.from_root(tmp_path), run, cfg, figures=False)
+    assert set(run.group_correlations) == {"topology=gyroid", "topology=honeycomb"}
+    assert sum(r.n_tests for r in run.group_correlations.values()) == len(metrics) - 5

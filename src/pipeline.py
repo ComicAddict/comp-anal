@@ -583,8 +583,12 @@ def run_group_correlations(
     if column is None:
         return
     name = display_name(column)
-    values = result.metrics[column].astype(str).str.strip()
-    for level in sorted(v for v in values.unique() if v and v.lower() != "nan"):
+    # Tests with no value (registered by hand, outside any series) belong to
+    # no group. Missing values are dropped before the text conversion: pandas
+    # 3 keeps them as NaN through astype(str) rather than as "nan".
+    raw = result.metrics[column]
+    values = raw.where(raw.notna(), "").astype(str).str.strip()
+    for level in sorted(set(values) - {""}):
         subset = result.metrics[values == level].reset_index(drop=True)
         if len(subset) < cfg.correlation_min_n or not correlation.has_parameters(subset, cfg):
             continue

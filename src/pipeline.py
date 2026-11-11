@@ -121,6 +121,8 @@ class PipelineResult:
     correlation_files: list[Path] = field(default_factory=list)
     #: "<parameter>=<level>" -> CorrelationResult, from correlation_split_by.
     group_correlations: dict[str, Any] = field(default_factory=dict)
+    scale_match: Any = None              # ScaleMatchResult, when configured
+    scale_match_skipped: str = ""        # why it could not run, if it could not
 
 
 # ----------------------------------------------------------------------
@@ -542,8 +544,35 @@ def run_pipeline(
         )
     if correlate:
         run_correlation(paths, result, cfg, figures=figures)
+    run_scale_match(paths, result, cfg, figures=figures)
     write_manifest(paths, cfg)
     return result
+
+
+def run_scale_match(
+    paths: PipelinePaths,
+    result: PipelineResult,
+    cfg: AnalysisConfig = DEFAULT_CONFIG,
+    figures: bool = True,
+) -> None:
+    """Search the baselines' scale for the best match to the reference set."""
+    from . import scale_match
+
+    table_dir = paths.results_dir / "scale_match"
+    figure_dir = paths.figures_dir / "scale_match"
+    for directory in (table_dir, figure_dir):
+        if directory.exists():
+            shutil.rmtree(directory)
+    if not cfg.scale_match_column:
+        return
+    curves = {k: (c.strain, c.stress_MPa) for k, c in result.curves.items()}
+    try:
+        result.scale_match = scale_match.analyse(result.metrics, curves, cfg)
+    except ValueError as exc:
+        result.scale_match_skipped = str(exc)
+        return
+    scale_match.write_outputs(result.scale_match, result.metrics, table_dir, figure_dir,
+                              cfg, figures=figures)
 
 
 def run_correlation(

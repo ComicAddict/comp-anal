@@ -207,6 +207,15 @@ def summarise(result, paths: PipelinePaths) -> None:
     elif not result.skipped:
         explain_no_correlation(metrics, paths)
 
+    if result.scale_match is not None:
+        from src.scale_match import summarise as scale_summary
+
+        print("\n" + scale_summary(result.scale_match))
+        print(f"\n  tables  -> {paths.results_dir / 'scale_match'}/")
+        print(f"  figures -> {paths.figures_dir / 'scale_match'}/")
+    elif result.scale_match_skipped:
+        print(f"\nScale match not run: {result.scale_match_skipped}")
+
 
 def summary_table(metrics: pd.DataFrame) -> pd.DataFrame:
     """The headline numbers, truncation-safe ones first, bounds marked."""

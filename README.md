@@ -659,6 +659,70 @@ top of that.
 
 ---
 
+## Scale matching: which baseline scale behaves like plain?
+
+The TPMS baselines were printed at scales 1–8 of their defining function:
+features grow or shrink at the same volume fraction. `scale_match` searches
+along that scale for the value whose mechanical response best matches the
+plain woven set. It runs with every `run_analysis.py` (`scale_match_column` is
+set in `analysis_config.json`), or on its own, quickly, from the last run:
+
+```bash
+python scripts/match_scale.py                  # settings from analysis_config.json
+python scripts/match_scale.py --window 3 6     # the geometrically similar scales
+python scripts/match_scale.py --properties modulus_MPa plateau_stress_MPa
+```
+
+**How a match is measured.** Plain is 64 different patterns, so a baseline is
+compared with plain's *typical range*, not one curve:
+
+- *Property distance*: each property (modulus, plateau σ, σ at 10% and 20%,
+  W to 20%) as a robust z-score against plain — (value − plain median) / plain
+  spread, spread = 1.4826 × MAD — combined as an RMS. **Below 1 means inside
+  plain's typical spread.**
+- *Shape distance*: every curve divided by its own σ at 10%, compared point by
+  point with plain's median normalised curve. It asks whether the curve hardens
+  like plain, regardless of strength. If every scale is about equally close,
+  the summary says shape does not pick a scale, rather than naming a winner.
+
+**How the scale is chosen.** One specimen per type and scale is noisy, so the
+answer comes from a trend: each property is fitted as a quadratic in scale, the
+fitted distance is minimised over a fine grid, and a bootstrap — resampling
+the baselines *and* plain, whose median is itself an estimate — gives an
+interval. It is done for all types pooled (the answer to act on: every type
+was printed at every scale, so pooling is unbiased) and per type. Where each
+property's trend crosses plain's median is reported too: stiffness and
+strength need not match at the same scale. In a simulation check the reported
+interval contained the true scale about 85% of the time, and the summary says
+so rather than calling it a 95% interval.
+
+**The geometric window** (`scale_match_window`, 3–6 from the hole count
+through the body) is drawn on every figure and checked against the mechanical
+answer. A mechanical match inside the geometric window is much stronger
+evidence than either alone; one outside it says the geometry that looks alike
+does not behave alike.
+
+**Caution — mass.** Slicer mass changes with scale for some types even at the
+same volume fraction, and mass drives strength. The summary names those types,
+since part of their scale trend may be a mass trend. Weighing specimens is
+what settles it.
+
+Outputs: `results/scale_match/` — `summary.txt`, `best_scale.csv` (best scale,
+interval, distance, inside the window or not, per group), `by_scale.csv`
+(observed distances and median z-score per property for each type × scale),
+`crossings.csv`, `specimens.csv`, `reference.csv`. Figures in
+`results/figures/scale_match/`:
+
+- `scale_trends.png` — each property against scale, one line per type, the
+  pooled trend in black, plain's median and middle 50% as a grey band, the
+  geometric window shaded, the best scale dotted.
+- `scale_distance.png` — type × scale heatmaps of property and shape
+  distance, the closest scale boxed in each row.
+- `scale_curves.png` — plain's median curve and band against the median
+  baseline curve at each scale, as measured and normalised.
+
+---
+
 ## Regenerating when data changes
 
 `results/.input_manifest.json` records a content hash of `specimens.csv`, every
@@ -709,7 +773,7 @@ tests toe compensation leaves E unchanged and moves the stresses by about 1%
 ## Tests
 
 ```bash
-python -m pytest tests/ -q       # 243 tests
+python -m pytest tests/ -q       # 253 tests
 ```
 
 Coverage is aimed at the two things most likely to go quietly wrong: parsing
@@ -755,6 +819,7 @@ src/
   synthetic.py             instrument-format generation for tests and the demo
   metadata_import.py       metadata sheets -> specimens rows
   classes.py               property space and comparison by pattern class
+  scale_match.py           which baseline scale behaves most like the plain set
 analysis_config.json       machine setup (load limit), per-series split; loaded automatically
 metadata_sources.json      how to read each metadata sheet into specimens.csv
 scripts/
@@ -762,6 +827,7 @@ scripts/
   import_metadata.py       rebuild specimens.csv from the metadata sheets
   register_test.py         onboard a raw CSV into specimens.csv by hand
   correlate.py             parameter-property correlation, sliced as needed
+  match_scale.py           scale matching, re-run quickly with other settings
   run_analysis.py          raw -> metrics_summary.csv (+ figures)
   plot_envelope.py         figures from an existing metrics summary
   make_demo_data.py        64-test synthetic design space with planted causes

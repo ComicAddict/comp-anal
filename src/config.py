@@ -230,6 +230,31 @@ class AnalysisConfig:
     class_by: tuple[str, ...] = ()
 
     # ------------------------------------------------------------------
+    # Scale matching (src.scale_match)
+    # ------------------------------------------------------------------
+    #: Column holding the candidates' scale (the TPMS function scale). Unset
+    #: to skip the analysis.
+    scale_match_column: str | None = None
+    #: Which tests are the reference, and which are searched, as KEY=VALUE.
+    scale_match_reference: str = "family=plain"
+    scale_match_candidates: str = "family=tpms"
+    #: Each level is searched on its own as well as all together.
+    scale_match_group_by: str | None = "tpms_type"
+    #: Scales judged geometrically similar, (low, high); () for none. Drawn
+    #: on every figure and checked against the mechanical best match.
+    scale_match_window: tuple[float, ...] = ()
+    #: Properties matched. Truncation-safe ones: every test reaches them.
+    scale_match_properties: tuple[str, ...] = (
+        "modulus_MPa",
+        "plateau_stress_MPa",
+        "stress_at_10pct_MPa",
+        "stress_at_20pct_MPa",
+        "energy_to_20pct_MJ_m3",
+    )
+    #: A mass column; if it changes with scale, the summary says so.
+    scale_match_mass: str | None = "slicer_mass_g"
+
+    # ------------------------------------------------------------------
 
     @classmethod
     def from_json(cls, path: str | Path) -> "AnalysisConfig":

@@ -516,10 +516,33 @@ How the curves are coloured depends on how many patterns there are:
   date colours by days since the earliest. If the colour gradient lines up with
   curve height, that parameter orders the response: a visual correlation.
 
-The grid runs to the **shortest** test's maximum strain, so every curve is
-defined at every grid point and the envelope is real rather than an artefact of
-curves ending at different strains. The subtitle names that cap; use
-`--strain-max` to override it.
+The grid runs to the **longest** test (`envelope_extent: "full"`), and every
+curve is drawn to its own end, so nothing a test measured is cut off. A strip
+underneath counts the tests still running at each strain, and a dotted line
+marks the strain every test reaches. Past that line the set is shrinking, and
+on a load-limited frame the *strongest* tests stop first. A median over the
+survivors would then sag as each strong test drops out, which is not
+material behaviour. So range, middle 50% and median are drawn solid only while
+every test contributes, and faded and dotted after; they stop entirely where
+fewer than `envelope_min_tests` (3) remain. The load-limit stress (37.1 MPa on
+a 16 mm face) is drawn as a dashed line. `envelope_extent: "common"` restores
+the old cut at the shortest test; `--strain-max` caps the grid by hand.
+
+### Class envelopes
+With `class_by` set, the envelope is also split by class:
+
+- `class_envelopes.png` — one panel per class (each TPMS type, and plain),
+  same axes throughout: the class's curves, range, middle 50% and median, with
+  plain's median and middle 50% repeated in grey in every other panel, so each
+  baseline reads directly against the woven foam.
+- `class_envelope_overlay.png` — every class's median and middle 50% on one
+  axes; plain dashed.
+- `envelopes_by_<column>.png` — for each column in `envelope_split_by`
+  (`code_1`, `code_2`, `code_3`: the woven pattern-code digits), the plain
+  tests split by that digit, one panel per level, against all plain tests in
+  grey. Rename the digits in `metadata_sources.json` and the figures follow.
+
+The same solid-while-complete rule applies within each class.
 
 ### (b) `metric_space_*.png`
 Each derived metric against another, one point per test, with a convex hull
@@ -773,7 +796,7 @@ tests toe compensation leaves E unchanged and moves the stresses by about 1%
 ## Tests
 
 ```bash
-python -m pytest tests/ -q       # 253 tests
+python -m pytest tests/ -q       # 258 tests
 ```
 
 Coverage is aimed at the two things most likely to go quietly wrong: parsing
@@ -819,6 +842,7 @@ src/
   synthetic.py             instrument-format generation for tests and the demo
   metadata_import.py       metadata sheets -> specimens rows
   classes.py               property space and comparison by pattern class
+  class_envelopes.py       stress-strain envelopes per class and per code digit
   scale_match.py           which baseline scale behaves most like the plain set
 analysis_config.json       machine setup (load limit), per-series split; loaded automatically
 metadata_sources.json      how to read each metadata sheet into specimens.csv

@@ -460,7 +460,8 @@ def make_figures(
     rows = [row for row in metrics.itertuples(index=False) if str(row.test_id) in curves]
     items = [(str(r.test_id), str(r.pattern_name), curves[str(r.test_id)]) for r in rows]
     if items:
-        matrix = build_curve_matrix(items, cfg.envelope_n_points, strain_max)
+        matrix = build_curve_matrix(items, cfg.envelope_n_points, strain_max, cfg.envelope_extent)
+        limit_stress = load_limit_stress(metrics, cfg)
         values = None
         if color_col:
             lookup = metrics.set_index(metrics["test_id"].astype(str))[color_by_values]
@@ -468,10 +469,14 @@ def make_figures(
         written.append(
             plot_stress_strain_envelope(
                 matrix, paths.figures_dir / "stress_strain_envelope.png", cfg,
-                color_values=values, color_label=color_label,
+                color_values=values, color_label=color_label, limit_stress=limit_stress,
             )
         )
         matrix.frame().to_csv(paths.results_dir / "resampled_curves.csv")
+
+        from .class_envelopes import make_class_envelopes
+
+        written += make_class_envelopes(metrics, matrix, paths.figures_dir, cfg, limit_stress)
 
         load_limited = (
             "ended_at_force_limit" in metrics.columns
@@ -506,6 +511,16 @@ def make_figures(
             written.append(out)
 
     return written
+
+
+def load_limit_stress(metrics: pd.DataFrame, cfg: AnalysisConfig) -> float | None:
+    """The stress the load limit allows, when every test has the same area."""
+    if not cfg.force_limit_kN or "cross_section_area_mm2" not in metrics.columns:
+        return None
+    areas = pd.to_numeric(metrics["cross_section_area_mm2"], errors="coerce").dropna().unique()
+    if len(areas) != 1 or areas[0] <= 0:
+        return None
+    return cfg.force_limit_kN * 1000.0 / float(areas[0])
 
 
 def available_parameters(metrics: pd.DataFrame) -> list[str]:

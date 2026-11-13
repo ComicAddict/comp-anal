@@ -297,3 +297,60 @@ def test_densification_check_figure_states_the_verdict(monkeypatch, tmp_path):
     title = captured["fig"].axes[0].get_title(loc="left")
     assert "1 of 2 tests reached densification" in title
     assert "the others stop at r =" in title and "load limit" in title
+
+
+# ------------------------------------------------------------ full extent ----
+def test_full_extent_keeps_every_strain():
+    curves = [
+        ("a", "p1", make_curve("a", 10, max_strain=0.6)),
+        ("b", "p1", make_curve("b", 12, max_strain=0.35)),
+    ]
+    matrix = build_curve_matrix(curves, n_points=100, extent="full")
+    assert matrix.grid[-1] == pytest.approx(0.6)
+    assert matrix.full_extent and matrix.limiting_test == "b"
+    assert matrix.limiting_strain == pytest.approx(0.35)
+    assert matrix.count[0] == 2 and matrix.count[-1] == 1
+
+
+def test_equal_lengths_are_not_reported_as_capped():
+    curves = [("a", "p", make_curve("a", 10, max_strain=0.4)),
+              ("b", "p", make_curve("b", 12, max_strain=0.4))]
+    for extent in ("full", "common"):
+        matrix = build_curve_matrix(curves, n_points=50, extent=extent)
+        assert matrix.limiting_test == "" and not matrix.full_extent
+
+
+def test_statistics_are_flagged_where_tests_have_stopped():
+    from src.envelope import envelope_stats
+
+    curves = [(c, "p", make_curve(c, 10 + i, max_strain=0.3 + 0.1 * i)) for i, c in enumerate("abcd")]
+    matrix = build_curve_matrix(curves, n_points=200, extent="full")
+    stats_ = envelope_stats(matrix.stress, 3)
+    assert stats_.complete[matrix.grid <= 0.3].all()
+    assert not stats_.complete[matrix.grid > 0.31].any()
+    # Two tests left past 0.5: too few for a band, so it is not drawn there.
+    assert np.isnan(stats_.median[matrix.grid > 0.51]).all()
+
+
+def test_full_extent_figure_has_a_count_strip(tmp_path):
+    curves = [(c, c, make_curve(c, 10 + i, max_strain=0.3 + 0.05 * i)) for i, c in enumerate("abcdefghij")]
+    matrix = build_curve_matrix(curves, n_points=200, extent="full")
+    out = plot_stress_strain_envelope(matrix, tmp_path / "env.png", DEFAULT_CONFIG, limit_stress=5.0)
+    assert out.exists()
+
+
+def test_class_envelopes_are_written(tmp_path):
+    from src.class_envelopes import make_class_envelopes
+
+    curves, rows = [], []
+    for i in range(12):
+        curves.append((f"p{i}", f"p{i}", make_curve(f"p{i}", 10 + i % 4, max_strain=0.3 + 0.01 * i)))
+        rows.append({"test_id": f"p{i}", "param_family": "plain", "param_code_1": str(i % 3)})
+    for t in ("gyroid", "schwarz_p"):
+        for j in range(5):
+            curves.append((f"{t}{j}", f"{t}{j}", make_curve(f"{t}{j}", 8 + j, max_strain=0.35)))
+            rows.append({"test_id": f"{t}{j}", "param_family": "tpms", "param_tpms_type": t})
+    cfg = DEFAULT_CONFIG.replace(class_by=("tpms_type", "family"), envelope_split_by=("code_1", "nope"))
+    matrix = build_curve_matrix(curves, n_points=150, extent="full")
+    written = {p.name for p in make_class_envelopes(pd.DataFrame(rows), matrix, tmp_path, cfg)}
+    assert written == {"class_envelopes.png", "class_envelope_overlay.png", "envelopes_by_code_1.png"}

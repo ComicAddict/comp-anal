@@ -292,37 +292,121 @@ class CurveMatrix:
     test_ids: list[str]
     patterns: list[str]
     limiting_test: str = ""
-    limiting_strain: float = float("nan")
+    limiting_strain: float = float("nan")   # the shortest test's end
+    full_extent: bool = False               # grid runs past the shortest test
 
     def frame(self) -> pd.DataFrame:
         return pd.DataFrame(self.stress.T, index=self.grid, columns=self.test_ids)
+
+    @property
+    def count(self) -> np.ndarray:
+        """How many tests have data at each grid strain."""
+        return np.isfinite(self.stress).sum(axis=0)
+
+    def subset(self, rows: Sequence[int]) -> "CurveMatrix":
+        rows = list(rows)
+        return CurveMatrix(
+            grid=self.grid, stress=self.stress[rows, :],
+            test_ids=[self.test_ids[i] for i in rows],
+            patterns=[self.patterns[i] for i in rows],
+            limiting_test=self.limiting_test, limiting_strain=self.limiting_strain,
+            full_extent=self.full_extent,
+        )
+
+
+@dataclass
+class EnvelopeStats:
+    """Range, quartiles and median at each strain, NaN where too few tests."""
+
+    count: np.ndarray
+    lo: np.ndarray
+    hi: np.ndarray
+    q1: np.ndarray
+    q3: np.ndarray
+    median: np.ndarray
+    complete: np.ndarray        # every test of the set still has data here
+
+
+def envelope_stats(stress: np.ndarray, min_tests: int = 3) -> EnvelopeStats:
+    count = np.isfinite(stress).sum(axis=0)
+    with np.errstate(invalid="ignore"), _quiet_nan_warnings():
+        lo, hi = np.nanmin(stress, axis=0), np.nanmax(stress, axis=0)
+        q1, median, q3 = np.nanpercentile(stress, [25, 50, 75], axis=0)
+    thin = count < max(min_tests, 1)
+    for arr in (lo, hi, q1, q3, median):
+        arr[thin] = np.nan
+    return EnvelopeStats(count, lo, hi, q1, q3, median, count == stress.shape[0])
+
+
+def _with_edge(mask: np.ndarray) -> np.ndarray:
+    """Extend a mask one point into its neighbours, so two parts join up."""
+    out = mask.copy()
+    out[:-1] |= mask[1:]
+    out[1:] |= mask[:-1]
+    return out
+
+
+def draw_stat_line(ax: plt.Axes, grid: np.ndarray, values: np.ndarray, complete: np.ndarray,
+                   zorder: int = 4, **kw: Any) -> Any:
+    """Solid where every test contributes; faded and dotted where some have stopped.
+
+    Past the first test's end the statistic describes a shrinking set -- on a
+    load-limited frame the strongest tests leave first -- so it must not read
+    as a measured trend.
+    """
+    (line,) = ax.plot(grid, np.where(complete, values, np.nan), zorder=zorder, **kw)
+    partial = ~complete
+    if partial.any():
+        faded = {**kw, "linestyle": ":", "alpha": 0.55 * kw.get("alpha", 1.0)}
+        faded.pop("label", None)
+        ax.plot(grid, np.where(_with_edge(partial), values, np.nan), zorder=zorder, **faded)
+    return line
+
+
+def draw_stat_band(ax: plt.Axes, grid: np.ndarray, lo: np.ndarray, hi: np.ndarray,
+                   complete: np.ndarray, alpha: float, zorder: int = 2, **kw: Any) -> Any:
+    """A band at full strength where complete, at a third of it elsewhere."""
+    band = ax.fill_between(grid, lo, hi, where=complete, alpha=alpha, linewidth=0,
+                           zorder=zorder, **kw)
+    if (~complete).any():
+        rest = {k: v for k, v in kw.items() if k != "label"}
+        ax.fill_between(grid, lo, hi, where=_with_edge(~complete), alpha=alpha / 3,
+                        linewidth=0, zorder=zorder, **rest)
+    return band
 
 
 def build_curve_matrix(
     curves: Iterable[tuple[str, str, StressStrainCurve]],
     n_points: int = DEFAULT_CONFIG.envelope_n_points,
     strain_max: float | None = None,
+    extent: str = "common",
 ) -> CurveMatrix:
     """Resample every curve onto a shared strain grid.
 
-    The grid runs from 0 to the smallest maximum strain across all tests, so
-    every curve is defined at every grid point and the envelope is a genuine
-    min/max rather than an artefact of curves ending at different strains. The
-    test that sets that limit is recorded, since one short test silently
-    truncating the comparison is worth knowing about.
+    ``extent="full"`` runs the grid to the longest test, each curve NaN past
+    its own end, so nothing a test measured is thrown away. ``"common"`` stops
+    at the shortest test, so every curve spans the whole grid. Either way the
+    shortest test is recorded: past it, the set of curves is shrinking, and on
+    a load-limited frame the strongest tests leave first.
     """
     items = list(curves)
     if not items:
         raise ValueError("no curves to build an envelope from")
+    if extent not in ("full", "common"):
+        raise ValueError(f"extent must be 'full' or 'common', got {extent!r}")
 
     max_strains = [float(c.max_strain) for _, _, c in items]
-    if strain_max is None:
-        limit_idx = int(np.argmin(max_strains))
-        limit = max_strains[limit_idx]
-        limiting_test = items[limit_idx][0]
-    else:
+    short_idx = int(np.argmin(max_strains))
+    shortest = max_strains[short_idx]
+    # Only a test that ends before the others limits anything.
+    limiting_test = items[short_idx][0] if np.nanmax(max_strains) > shortest * (1 + 1e-9) else ""
+    if strain_max is not None:
         limit = float(strain_max)
-        limiting_test = ""
+        limiting_test = limiting_test if limit > shortest else ""
+    elif extent == "full":
+        limit = float(np.nanmax(max_strains))
+    else:
+        limit = shortest
 
     if not np.isfinite(limit) or limit <= 0:
         raise ValueError(f"common strain limit is not usable: {limit}")
@@ -337,8 +421,42 @@ def build_curve_matrix(
         test_ids=[t for t, _, _ in items],
         patterns=[p for _, p, _ in items],
         limiting_test=limiting_test,
-        limiting_strain=limit,
+        limiting_strain=shortest,
+        full_extent=limit > shortest * (1 + 1e-9),
     )
+
+
+def _count_strip(ax: plt.Axes, grid: np.ndarray, count: np.ndarray, total: int) -> None:
+    """Small panel under an envelope: how many tests still have data."""
+    ax.fill_between(grid, 0, count, step="mid", color=INK_MUTED, alpha=0.35, linewidth=0)
+    ax.plot(grid, count, drawstyle="steps-mid", color=INK_SECONDARY, linewidth=1)
+    ax.set_ylim(0, max(total, 1) * 1.08)
+    ax.set_yticks([0, total])
+    ax.set_ylabel("tests", color=INK_SECONDARY, fontsize=8)
+    ax.set_xlabel("Engineering strain (mm/mm)", color=INK_SECONDARY, fontsize=10)
+    ax.grid(True, axis="x", color=GRID, linewidth=0.8)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(GRID)
+    ax.tick_params(colors=INK_SECONDARY, labelsize=8, length=0)
+    ax.set_facecolor(SURFACE)
+
+
+def _full_extent_marks(ax: plt.Axes, matrix: CurveMatrix, limit_stress: float | None) -> list[Any]:
+    """The strain every test reaches, and the stress the load limit allows."""
+    handles: list[Any] = []
+    if matrix.full_extent and np.isfinite(matrix.limiting_strain):
+        handles.append(ax.axvline(
+            matrix.limiting_strain, color=INK_SECONDARY, linestyle=":", linewidth=1.1, zorder=5,
+            label=f"every test reaches ε = {matrix.limiting_strain:.3f}",
+        ))
+    if limit_stress is not None and np.isfinite(limit_stress):
+        handles.append(ax.axhline(
+            limit_stress, color=INK_SECONDARY, linestyle="--", linewidth=0.9, zorder=5,
+            label=f"load limit ({limit_stress:.1f} MPa)",
+        ))
+    return handles
 
 
 def plot_stress_strain_envelope(
@@ -349,6 +467,7 @@ def plot_stress_strain_envelope(
     title: str = "Design-space envelope: engineering stress-strain",
     color_values: Sequence[Any] | None = None,
     color_label: str = "",
+    limit_stress: float | None = None,
 ) -> Path:
     """Overlay every curve and shade the stress range achieved at each strain.
 
@@ -356,6 +475,11 @@ def plot_stress_strain_envelope(
     information is the overall range, the middle-50% band and the median, so
     those are drawn on top. Colouring by a parameter (`color_values`) instead
     shows whether that parameter orders the curves -- a visual correlation.
+
+    On a full-extent grid a strip underneath counts the tests still running at
+    each strain. Bands are drawn only where `envelope_min_tests` remain, and
+    past the shortest test they describe a shrinking set: on a load-limited
+    frame the strongest tests stop first, so the median there leans low.
     """
     if per_pattern_bands is None:
         per_pattern_bands = cfg.envelope_per_pattern_bands
@@ -363,29 +487,28 @@ def plot_stress_strain_envelope(
     spec = color_spec(matrix.patterns, cfg, color_values, color_label)
     n_tests = len(matrix.test_ids)
     n_patterns = len(set(matrix.patterns))
-    fig, ax = new_figure((9.0, 6.0))
+    stats_ = envelope_stats(matrix.stress, min(cfg.envelope_min_tests, max(n_tests, 1)))
+    if matrix.full_extent:
+        fig, (ax, strip) = plt.subplots(
+            2, 1, figsize=(9.0, 7.0), sharex=True, gridspec_kw={"height_ratios": [5, 1], "hspace": 0.06}
+        )
+        fig.patch.set_facecolor(SURFACE)
+    else:
+        fig, ax = new_figure((9.0, 6.0))
+        strip = None
     handles: list[Any] = []
 
-    with np.errstate(invalid="ignore"), _quiet_nan_warnings():
-        lo = np.nanmin(matrix.stress, axis=0)
-        hi = np.nanmax(matrix.stress, axis=0)
     handles.append(
-        ax.fill_between(
-            matrix.grid, lo, hi, color=INK_MUTED, alpha=0.12, linewidth=0,
-            label="Range across all tests", zorder=1,
-        )
+        draw_stat_band(ax, matrix.grid, stats_.lo, stats_.hi, stats_.complete, 0.12,
+                       zorder=1, color=INK_MUTED, label="Range across all tests")
     )
 
     if spec.mode == "single":
         # Many tests: the distribution is the message, so draw it explicitly.
         if n_tests >= 8:
-            with _quiet_nan_warnings():
-                q25, q75 = np.nanpercentile(matrix.stress, [25, 75], axis=0)
             handles.append(
-                ax.fill_between(
-                    matrix.grid, q25, q75, color=INK_MUTED, alpha=0.38,
-                    linewidth=0, label="Middle 50% of tests", zorder=2,
-                )
+                draw_stat_band(ax, matrix.grid, stats_.q1, stats_.q3, stats_.complete, 0.38,
+                               zorder=2, color=INK_MUTED, label="Middle 50% of tests")
             )
         alpha = float(np.clip(3.0 / np.sqrt(max(n_tests, 1)), 0.15, 0.85))
         for row in range(n_tests):
@@ -398,13 +521,10 @@ def plot_stress_strain_envelope(
                    label=f"Individual tests (n={n_tests})")
         )
         if n_tests >= 3:
-            with _quiet_nan_warnings():
-                median = np.nanmedian(matrix.stress, axis=0)
-            (line,) = ax.plot(
-                matrix.grid, median, color=INK, linewidth=2.0,
-                label="Median across tests", zorder=4,
-            )
-            handles.append(line)
+            handles.append(draw_stat_line(
+                ax, matrix.grid, stats_.median, stats_.complete, color=INK, linewidth=2.0,
+                label="Median across tests",
+            ))
     else:
         if spec.by_pattern and per_pattern_bands:
             # Per-pattern replicate spread, separating pattern-to-pattern
@@ -413,12 +533,10 @@ def plot_stress_strain_envelope(
                 rows = [i for i, p in enumerate(matrix.patterns) if str(p) == pattern]
                 if len(rows) < 2:
                     continue
-                block = matrix.stress[rows, :]
-                with np.errstate(invalid="ignore"), _quiet_nan_warnings():
-                    ax.fill_between(
-                        matrix.grid, np.nanmin(block, axis=0), np.nanmax(block, axis=0),
-                        color=color, alpha=0.12, linewidth=0, zorder=2,
-                    )
+                block = envelope_stats(matrix.stress[rows, :], 2)
+                ax.fill_between(
+                    matrix.grid, block.lo, block.hi, color=color, alpha=0.12, linewidth=0, zorder=2,
+                )
         for row, color in enumerate(spec.colors):
             ax.plot(
                 matrix.grid, matrix.stress[row], color=color,
@@ -430,18 +548,24 @@ def plot_stress_strain_envelope(
             handles.append(
                 Line2D([], [], color=MISSING_COLOR, linewidth=2, label="no value")
             )
+    handles += _full_extent_marks(ax, matrix, limit_stress)
 
     subtitle = f"{n_tests} tests · {n_patterns} patterns"
     if spec.mode == "continuous":
         subtitle += f" · coloured by {spec.label}"
-    if matrix.limiting_test:
+    if matrix.full_extent:
+        subtitle += " · past the dotted line tests start stopping, strongest first: statistics fade there"
+    elif matrix.limiting_test:
         subtitle += f" · strain grid capped at {matrix.limiting_strain:.3f} (shortest test)"
 
     style_axes(
-        ax, title, "Engineering strain (mm/mm)", "Engineering stress (MPa)", subtitle
+        ax, title, "" if strip is not None else "Engineering strain (mm/mm)",
+        "Engineering stress (MPa)", subtitle,
     )
     ax.set_xlim(0, matrix.grid[-1])
     ax.set_ylim(bottom=0)
+    if strip is not None:
+        _count_strip(strip, matrix.grid, matrix.count, n_tests)
 
     legend = ax.legend(
         handles=handles, frameon=False, fontsize=8, loc="upper left",

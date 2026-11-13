@@ -174,6 +174,16 @@ class AnalysisConfig:
     # Envelope plotting (src.envelope)
     # ------------------------------------------------------------------
     envelope_n_points: int = 500
+    #: "full": the strain grid runs to the longest test, each curve drawn to
+    #: its own end. "common": cut at the shortest test, so every curve spans
+    #: the whole grid (the older behaviour).
+    envelope_extent: str = "full"
+    #: Range, middle-50% and median are drawn only where at least this many
+    #: tests still have data, so a band is never one curve posing as a spread.
+    envelope_min_tests: int = 3
+    #: Extra envelope figures splitting the tests that have a value in each of
+    #: these columns by its levels -- e.g. the plain patterns by code digit.
+    envelope_split_by: tuple[str, ...] = ()
     envelope_per_pattern_bands: bool = True
     figure_dpi: int = 150
     #: Up to this many patterns, each gets its own colour and legend entry.
